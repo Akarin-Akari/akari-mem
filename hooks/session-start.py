@@ -2,45 +2,33 @@
 """
 akari-mem SessionStart hook for Claude Code.
 
-Called by Claude Code's SessionStart hook to auto-inject recent memories
-into the conversation context. Outputs to stderr which Claude Code reads.
+Called by Claude Code's SessionStart hook to auto-inject recent memories.
+Outputs to stderr which Claude Code reads.
 
-Usage in hooks.json:
-  "SessionStart": [{
-    "matcher": "*",
-    "hooks": [{
-      "type": "command",
-      "command": "python F:\\claude-tools\\akari-mem-mcp\\hooks\\session-start.py",
-      "timeout": 30
-    }]
-  }]
+Setup: Add to hooks.json SessionStart array.
 """
 import sys, os, json
 
-# Ensure correct paths
-_extra = os.environ.get("AKARI_MEM_LIBS", r"F:\python-libs")
-if os.path.isdir(_extra) and _extra not in sys.path:
-    sys.path.append(_extra)
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-os.environ.setdefault("HF_HOME", "F:\\models")
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+# Setup paths via env_loader
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _project_root)
+from env_loader import setup, resolve_config
+setup()
 
 try:
     from store import MemoryStore
     from embeddings import create_provider
 
     # Load config
-    config_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json"
-    )
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = json.load(f)
+    config_path = os.path.join(_project_root, "config.json")
+    defaults = {"data_dir": os.path.join(_project_root, "data"), "embedding": {"mode": "default"}}
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            defaults.update(json.load(f))
+    config = resolve_config(defaults)
 
     provider = create_provider(config.get("embedding", {}))
-    store = MemoryStore(
-        data_dir=config["data_dir"], embedding_provider=provider
-    )
+    store = MemoryStore(data_dir=config["data_dir"], embedding_provider=provider)
 
     # Get recent memories (last 10)
     recent = store.list_recent(10)
@@ -56,7 +44,6 @@ try:
         lines.append(f"[akari-mem] Total: {len(recent)} recent | Use search_memory for semantic search")
         lines.append("")
 
-        # Output to stderr — Claude Code hooks capture stderr
         for line in lines:
             print(line, file=sys.stderr)
 

@@ -57,7 +57,7 @@ class LocalReranker(Reranker):
     ):
         self._model_name = model_name
         self._cache_dir = cache_dir or os.environ.get(
-            "AKARI_MODEL_CACHE", "F:/models"
+            "HF_HOME", None
         )
         self._model = None
 
@@ -69,7 +69,7 @@ class LocalReranker(Reranker):
             except ImportError:
                 raise RuntimeError(
                     "sentence-transformers not installed. "
-                    "Run: pip install sentence-transformers --target F:\\python-libs"
+                    "Run: pip install sentence-transformers"
                 )
             self._model = CrossEncoder(
                 self._model_name, cache_folder=self._cache_dir

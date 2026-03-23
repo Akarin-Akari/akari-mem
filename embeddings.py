@@ -57,7 +57,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
             except ImportError:
                 raise RuntimeError(
                     "sentence-transformers not installed. "
-                    "Run: pip install sentence-transformers --target F:\\python-libs"
+                    "Run: pip install sentence-transformers"
                 )
             self._model = SentenceTransformer(
                 self._model_name, cache_folder=self._cache_dir
