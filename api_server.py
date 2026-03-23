@@ -27,12 +27,8 @@ _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-_EXTRA_LIB = os.environ.get("AKARI_MEM_LIBS", r"F:\python-libs")
-if os.path.isdir(_EXTRA_LIB) and _EXTRA_LIB not in sys.path:
-    sys.path.append(_EXTRA_LIB)
-
-os.environ.setdefault("HF_HOME", r"F:\models")
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+from env_loader import setup, resolve_config
+setup()
 
 CONFIG_PATH = os.path.join(_PROJECT_ROOT, "config.json")
 
@@ -41,7 +37,7 @@ def load_config():
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             defaults.update(json.load(f))
-    return defaults
+    return resolve_config(defaults)
 
 config = load_config()
 DB_PATH = os.path.join(config["data_dir"], "akari-mem.db")

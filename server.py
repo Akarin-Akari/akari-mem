@@ -13,15 +13,13 @@ import json
 import asyncio
 import logging
 
-# Add F:\python-libs to path for chromadb etc. (append, not insert, so system packages take priority)
-_EXTRA_LIB = os.environ.get("AKARI_MEM_LIBS", r"F:\python-libs")
-if os.path.isdir(_EXTRA_LIB) and _EXTRA_LIB not in sys.path:
-    sys.path.append(_EXTRA_LIB)
-
-# Project root to path
+# Load .env and setup paths
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
+
+from env_loader import setup, resolve_config, load_dotenv
+setup()
 
 from mcp.server.fastmcp import FastMCP
 from store import MemoryStore
@@ -33,7 +31,7 @@ from rerank import create_reranker
 CONFIG_PATH = os.path.join(_PROJECT_ROOT, "config.json")
 
 def load_config() -> dict:
-    """Load config from config.json, fallback to defaults."""
+    """Load config from config.json + env vars."""
     defaults = {
         "data_dir": os.path.join(_PROJECT_ROOT, "data"),
         "embedding": {"mode": "default"},
@@ -43,7 +41,7 @@ def load_config() -> dict:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             user_cfg = json.load(f)
         defaults.update(user_cfg)
-    return defaults
+    return resolve_config(defaults)
 
 
 # ── Globals ─────────────────────────────────────────────────
