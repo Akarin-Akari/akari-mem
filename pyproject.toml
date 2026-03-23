@@ -1,0 +1,17 @@
+[project]
+name = "akari-mem-mcp"
+version = "0.1.0"
+description = "Akari's personal MCP memory server — SQLite + ChromaDB (BGE-M3) dual-engine"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "chromadb>=1.0.0",
+]
+
+[project.optional-dependencies]
+local = [
+    "sentence-transformers>=2.0.0",
+]
+
+[project.scripts]
+akari-mem = "server:main"

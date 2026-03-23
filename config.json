@@ -1,0 +1,14 @@
+{
+    "data_dir": "F:/claude-tools/akari-mem-mcp/data",
+    "embedding": {
+        "mode": "local",
+        "model": "BAAI/bge-m3",
+        "cache_dir": "F:/models"
+    },
+    "rerank": {
+        "mode": "local",
+        "model": "BAAI/bge-reranker-v2-m3",
+        "cache_dir": "F:/models"
+    },
+    "log_level": "INFO"
+}
