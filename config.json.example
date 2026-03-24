@@ -1,0 +1,11 @@
+{
+    "embedding": {
+        "mode": "local",
+        "model": "BAAI/bge-m3"
+    },
+    "rerank": {
+        "mode": "local",
+        "model": "BAAI/bge-reranker-v2-m3"
+    },
+    "log_level": "INFO"
+}

@@ -14,6 +14,9 @@ ENV/
 # Local Data / Databases
 data/
 
+# Local config (personal paths, may differ per machine)
+config.json
+
 # IDEs
 .vscode/
 .idea/

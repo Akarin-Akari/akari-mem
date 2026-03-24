@@ -52,9 +52,26 @@ def resolve_config(user_cfg: dict) -> dict:
     return user_cfg
 
 
+def _init_from_example(filename: str) -> bool:
+    """Copy filename.example -> filename if the target doesn't exist. Returns True if copied."""
+    target = os.path.join(_PROJECT_ROOT, filename)
+    example = os.path.join(_PROJECT_ROOT, f"{filename}.example")
+    if not os.path.exists(target) and os.path.exists(example):
+        import shutil
+        shutil.copy2(example, target)
+        print(f"[akari-mem] Initialized '{filename}' from '{filename}.example' (please review it)")
+        return True
+    return False
+
+
 def setup():
     """One-call init: load .env, setup extra lib path."""
     import sys
+
+    # Auto-initialize config files from .example templates on first run
+    _init_from_example(".env")
+    _init_from_example("config.json")
+
     load_dotenv()
 
     # Extra Python libs path
