@@ -20,3 +20,4 @@ config.json
 # IDEs
 .vscode/
 .idea/
+.ace-tool/

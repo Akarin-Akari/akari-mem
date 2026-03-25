@@ -3,7 +3,7 @@
 import subprocess, json, sys, time
 
 server_cmd = [
-    sys.executable, r"F:\claude-tools\akari-mem-mcp\server.py"
+    r"F:\claude-tools\akari-mem-mcp\.venv\Scripts\python.exe", r"F:\claude-tools\akari-mem-mcp\server.py"
 ]
 env = {
     "HF_HOME": r"F:\models",
