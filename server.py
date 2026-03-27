@@ -7,8 +7,18 @@ Usage:
   python server.py --rebuild          # Rebuild vector index, then start
   python server.py --test             # Run quick search test
 """
-import sys
 import os
+
+# ── CRITICAL: Silence model loading output BEFORE any imports ────
+# MCP uses stdio pipes. Model loading (HF, tqdm, transformers) writes
+# progress to stdout/stderr. If the pipe buffer fills and the host
+# doesn't consume fast enough, the warmup thread blocks forever.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", os.environ.get("AKARI_MODEL_CACHE", ""))
+
+import sys
 import json
 import asyncio
 import logging
@@ -19,12 +29,48 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 from env_loader import setup, resolve_config, load_dotenv
-setup()
+setup()  # reads .env, may append AKARI_MEM_LIBS to sys.path
+
+# ── CRITICAL: Remove polluting global Python 3.14 paths from sys.path ──
+# env_loader.setup() reads AKARI_MEM_LIBS=F:\python-libs from .env and appends it.
+# F:\python-libs pulls in C:\Python314's torchvision which has a circular import
+# bug that crashes sentence_transformers loading.
+# Use BLOCKLIST (remove known bad paths) not allowlist — preserves Python stdlib.
+_BAD_PATH_MARKERS = [
+    os.path.normcase(r"F:\python-libs"),
+    os.path.normcase(r"C:\Python314"),
+]
+sys.path[:] = [
+    _p for _p in sys.path
+    if not any(
+        os.path.normcase(os.path.abspath(_p)).startswith(_bad)
+        for _bad in _BAD_PATH_MARKERS
+    )
+]
+os.environ.pop("PYTHONPATH", None)
+os.environ.pop("AKARI_MEM_LIBS", None)  # prevent future re-injection
 
 from mcp.server.fastmcp import FastMCP
 from store import MemoryStore
 from embeddings import create_provider
 from rerank import create_reranker
+
+# Pre-import heavy libs at module level (before MCP stdio takes over).
+# These imports trigger grpc/protobuf/tqdm/CUDA init that writes to
+# stdout/stderr. If done inside the warmup thread (after MCP starts),
+# the output fills the pipe buffer and blocks the thread forever.
+try:
+    import chromadb  # noqa: F401 — grpc/protobuf init writes to stderr
+except ImportError:
+    pass
+try:
+    import sentence_transformers  # noqa: F401 — tqdm/transformers logging
+except ImportError:
+    pass
+try:
+    import torch  # noqa: F401 — CUDA init output
+except ImportError:
+    pass
 
 # ── Config ──────────────────────────────────────────────────
 
@@ -71,11 +117,9 @@ def get_store():
         return _store
     with _store_lock:
         if _store is None:
-            logger.info("Loading models...")
             p = create_provider(config.get("embedding", {}))
             r = create_reranker(config.get("rerank", {}))
             _store = MemoryStore(data_dir=config["data_dir"], embedding_provider=p, reranker=r)
-            logger.info("MemoryStore ready.")
     return _store
 
 def _background_warmup():
@@ -84,15 +128,41 @@ def _background_warmup():
     import time
     time.sleep(0.5)  # let MCP handshake complete first
     _warmup_state = "loading"
+
+    # File-based diagnostic log (bypasses MCP stdio pipe)
+    _log_path = os.path.join(config["data_dir"], "warmup.log")
+    def _log(msg):
+        try:
+            with open(_log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+                f.flush()
+        except Exception:
+            pass
+
     try:
-        logger.info("Background warmup: pre-loading models...")
-        get_store()
+        _log("Warmup started")
+        _log("Step 1: create_provider...")
+        p = create_provider(config.get("embedding", {}))
+        _log(f"Step 1 done: provider={type(p).__name__}")
+
+        _log("Step 2: create_reranker...")
+        r = create_reranker(config.get("rerank", {}))
+        _log(f"Step 2 done: reranker={type(r).__name__}")
+
+        _log("Step 3: MemoryStore init...")
+        from store import MemoryStore as _MS
+        _store_obj = _MS(data_dir=config["data_dir"], embedding_provider=p, reranker=r)
+        _log("Step 3 done: MemoryStore ready")
+
+        global _store
+        _store = _store_obj
         _warmup_state = "ready"
-        logger.info("Background warmup complete.")
+        _log("Warmup COMPLETE - models loaded")
     except Exception as e:
         _warmup_state = "failed"
         _warmup_error = str(e)
-        logger.exception(f"Background warmup FAILED: {e}")
+        import traceback
+        _log(f"Warmup FAILED: {e}\n{traceback.format_exc()}")
 
 def _save_to_sqlite(title, text, tags, project, source):
     """Fast SQLite-only save. Returns mem_id."""
@@ -145,9 +215,11 @@ mcp = FastMCP(
         "Akari's personal memory system with dual search strategy.\n"
         "- quick_search: instant keyword search (FTS5), use for simple lookups, name/term matching\n"
         "- search_memory: deep hybrid search (vector+keyword+RRF+rerank), use for semantic/complex queries\n"
+        "- get_memory(id): fetch full content of a memory by ID (use after search)\n"
         "- save_memory: store important findings\n"
         "- list_memories: see recent entries\n"
-        "Prefer quick_search first; escalate to search_memory if results are insufficient."
+        "Prefer quick_search first; escalate to search_memory if results are insufficient.\n"
+        "Search returns compact summaries — use get_memory(id) when you need the full text."
     ),
 )
 
@@ -200,11 +272,9 @@ async def quick_search(query: str, limit: int = 5) -> str:
 
         lines = [f"[quick] Found {len(rows)} matches:\n"]
         for r in rows:
-            lines.append(f"--- [#{r['id']}] {r['title']} ---")
-            lines.append(r["text"][:300])
-            if r["tags"]:
-                lines.append(f"  Tags: {r['tags']}")
-            lines.append("")
+            preview = r["text"][:100].replace("\n", " ")
+            tags_str = f"  Tags: {r['tags']}" if r["tags"] else ""
+            lines.append(f"#{r['id']} | {r['title']} | {preview}...{tags_str}")
         return "\n".join(lines)
 
     return await asyncio.to_thread(_impl)
@@ -226,18 +296,51 @@ async def search_memory(query: str, limit: int = 5) -> str:
         if not results:
             return "No memories found."
 
-        lines = [f"[deep] Found {len(results)} memories:\n"]
+        lines = [f"[deep] Found {len(results)} memories (use get_memory(id) for full content):\n"]
         for r in results:
-            dist = r.get("distance", "-")
             rrf = r.get("rrf_score", "-")
-            lines.append(f"--- [#{r['id']}] {r['title']} (dist={dist} rrf={rrf}) ---")
-            lines.append(r["text"][:300])
-            if r.get("tags"):
-                lines.append(f"  Tags: {r['tags']}")
-            if r.get("project"):
-                lines.append(f"  Project: {r['project']}")
-            lines.append(f"  Created: {r['created_at']}")
-            lines.append("")
+            preview = r["text"][:100].replace("\n", " ")
+            tags_str = f"  tags={r['tags']}" if r.get("tags") else ""
+            proj_str = f"  proj={r['project']}" if r.get("project") else ""
+            lines.append(f"#{r['id']} [rrf={rrf}] {r['title']}{tags_str}{proj_str}")
+            lines.append(f"  {preview}...")
+        return "\n".join(lines)
+
+    return await asyncio.to_thread(_impl)
+
+
+@mcp.tool()
+async def get_memory(memory_id: int) -> str:
+    """
+    Get full content of a memory by ID. Use after search to read complete details.
+
+    Args:
+        memory_id: The ID of the memory to retrieve
+    """
+    def _impl():
+        import sqlite3
+        db_path = os.path.join(config["data_dir"], "akari-mem.db")
+        if not os.path.exists(db_path):
+            return "No memory database found."
+        db = sqlite3.connect(db_path)
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        db.close()
+        if not row:
+            return f"Memory #{memory_id} not found."
+
+        lines = [
+            f"=== Memory #{row['id']}: {row['title']} ===",
+            row["text"],
+            "",
+        ]
+        if row["tags"]:
+            lines.append(f"Tags: {row['tags']}")
+        if row["project"]:
+            lines.append(f"Project: {row['project']}")
+        if row["source"]:
+            lines.append(f"Source: {row['source']}")
+        lines.append(f"Created: {row['created_at']}")
         return "\n".join(lines)
 
     return await asyncio.to_thread(_impl)
