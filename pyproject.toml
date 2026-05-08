@@ -12,6 +12,9 @@ dependencies = [
 local = [
     "sentence-transformers>=2.0.0",
 ]
+fastembed = [
+    "fastembed>=0.5.0",
+]
 
 [project.scripts]
 akari-mem = "server:main"

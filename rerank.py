@@ -4,10 +4,11 @@ Rerank module for akari-mem-mcp.
 Two-stage retrieval: first retrieve candidates via embedding search,
 then re-score with a cross-encoder reranker for higher precision.
 
-Supports 3 modes:
-1. LOCAL  — cross-encoder model (e.g., BAAI/bge-reranker-v2-m3)
-2. API    — Jina/Cohere rerank API
-3. NONE   — disabled (default), pass-through
+Supports 4 modes:
+1. LOCAL     — cross-encoder via sentence-transformers (PyTorch)
+2. FASTEMBED — cross-encoder via FastEmbed ONNX (lightweight)
+3. API       — Jina/Cohere rerank API
+4. NONE      — disabled (default), pass-through
 """
 import os
 import json
@@ -164,6 +165,67 @@ class APIReranker(Reranker):
         return self._model_name
 
 
+class FastEmbedReranker(Reranker):
+    """
+    Lightweight ONNX-based cross-encoder reranker via FastEmbed (by Qdrant).
+    Recommended: jinaai/jina-reranker-v2-base-multilingual
+
+    Compared to LocalReranker (PyTorch): lower memory, faster CPU inference.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "jinaai/jina-reranker-v2-base-multilingual",
+        cache_dir: Optional[str] = None,
+    ):
+        self._model_name = model_name
+        self._cache_dir = cache_dir or os.environ.get(
+            "AKARI_MODEL_CACHE", "F:/models/fastembed"
+        )
+        self._model = None
+
+    def _load(self):
+        if self._model is None:
+            logger.info(f"Loading FastEmbed reranker: {self._model_name} ...")
+            try:
+                from fastembed.rerank.cross_encoder import TextCrossEncoder
+            except ImportError:
+                raise RuntimeError(
+                    "fastembed not installed. "
+                    "Run: pip install fastembed"
+                )
+            self._model = TextCrossEncoder(
+                model_name=self._model_name,
+                cache_dir=self._cache_dir,
+            )
+            logger.info("FastEmbed reranker loaded.")
+
+    def rerank(
+        self, query: str, documents: List[Dict[str, Any]], top_k: int = 5
+    ) -> List[Dict[str, Any]]:
+        self._load()
+
+        if not documents:
+            return []
+
+        passages = [f"{doc['title']}\n{doc['text']}" for doc in documents]
+
+        # TextCrossEncoder.rerank() returns an iterable of float scores
+        # in the same order as the input passages
+        scores = list(self._model.rerank(query, passages))
+
+        # Attach scores and sort
+        for i, doc in enumerate(documents):
+            doc["rerank_score"] = float(scores[i])
+
+        reranked = sorted(documents, key=lambda d: d["rerank_score"], reverse=True)
+        return reranked[:top_k]
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+
 class NoReranker(Reranker):
     """Pass-through: no reranking, return as-is."""
 
@@ -182,8 +244,9 @@ def create_reranker(config: dict) -> Reranker:
     Factory: create reranker from config dict.
 
     Config examples:
-      {"mode": "none"}                         # disabled (default)
+      {"mode": "none"}                                    # disabled (default)
       {"mode": "local", "model": "BAAI/bge-reranker-v2-m3"}
+      {"mode": "fastembed", "model": "jinaai/jina-reranker-v2-base-multilingual"}
       {"mode": "api", "url": "https://api.jina.ai/v1/rerank",
        "key": "jina_xxx", "model": "jina-reranker-v2-base-multilingual"}
     """
@@ -192,6 +255,11 @@ def create_reranker(config: dict) -> Reranker:
     if mode == "local":
         return LocalReranker(
             model_name=config.get("model", "BAAI/bge-reranker-v2-m3"),
+            cache_dir=config.get("cache_dir"),
+        )
+    elif mode == "fastembed":
+        return FastEmbedReranker(
+            model_name=config.get("model", "jinaai/jina-reranker-v2-base-multilingual"),
             cache_dir=config.get("cache_dir"),
         )
     elif mode == "api":

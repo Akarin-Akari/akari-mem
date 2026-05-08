@@ -1,10 +1,11 @@
 """
 Embedding providers for akari-mem-mcp.
 
-Supports 3 modes:
-1. LOCAL  — sentence-transformers (BGE-M3, etc.), best quality
-2. API    — OpenAI-compatible embedding API, zero local resources
-3. DEFAULT — ChromaDB built-in (all-MiniLM-L6-v2), fallback
+Supports 4 modes:
+1. LOCAL     — sentence-transformers (BGE-M3, etc.), best quality
+2. FASTEMBED — ONNX-based FastEmbed (BGE-M3, etc.), lightweight & fast
+3. API       — OpenAI-compatible embedding API, zero local resources
+4. DEFAULT   — ChromaDB built-in (all-MiniLM-L6-v2), fallback
 """
 import os
 import json
@@ -172,6 +173,75 @@ class DefaultEmbeddingProvider(EmbeddingProvider):
         return "all-MiniLM-L6-v2"
 
 
+class FastEmbedProvider(EmbeddingProvider):
+    """
+    Lightweight ONNX-based embedding via FastEmbed (by Qdrant).
+    Uses quantized ONNX models — much lower memory and faster CPU inference
+    compared to sentence-transformers (PyTorch). Lazy-loads on first call.
+
+    Supported models include BAAI/bge-small-zh-v1.5, jinaai/jina-embeddings-v2-base-zh, etc.
+    """
+
+    # Known model dimensions (avoids loading model just to check dim)
+    _KNOWN_DIMS = {
+        "BAAI/bge-small-zh-v1.5": 512,
+        "jinaai/jina-embeddings-v2-base-zh": 768,
+        "BAAI/bge-small-en-v1.5": 384,
+        "BAAI/bge-base-en-v1.5": 768,
+        "BAAI/bge-large-en-v1.5": 1024,
+        "sentence-transformers/all-MiniLM-L6-v2": 384,
+    }
+
+    def __init__(
+        self,
+        model_name: str = "BAAI/bge-small-zh-v1.5",
+        cache_dir: Optional[str] = None,
+    ):
+        self._model_name = model_name
+        self._cache_dir = cache_dir or os.environ.get(
+            "AKARI_MODEL_CACHE", "F:/models/fastembed"
+        )
+        self._model = None
+        self._dim = self._KNOWN_DIMS.get(model_name)
+
+    def _load(self):
+        if self._model is None:
+            logger.info(f"Loading FastEmbed model: {self._model_name} ...")
+            try:
+                from fastembed import TextEmbedding
+            except ImportError:
+                raise RuntimeError(
+                    "fastembed not installed. "
+                    "Run: pip install fastembed"
+                )
+            self._model = TextEmbedding(
+                model_name=self._model_name,
+                cache_dir=self._cache_dir,
+            )
+            # Probe dimension if not known
+            if self._dim is None:
+                probe = list(self._model.embed(["dim probe"]))
+                self._dim = len(probe[0])
+            logger.info(
+                f"FastEmbed model loaded: {self._model_name} (dim={self._dim})"
+            )
+
+    def embed(self, texts: List[str]) -> List[List[float]]:
+        self._load()
+        # FastEmbed.embed() returns a generator of numpy arrays
+        return [vec.tolist() for vec in self._model.embed(texts)]
+
+    @property
+    def dimension(self) -> int:
+        if self._dim is None:
+            self._load()
+        return self._dim  # type: ignore
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+
 class ChromaEmbeddingAdapter:
     """
     Adapter that wraps EmbeddingProvider into ChromaDB's EmbeddingFunction
@@ -207,6 +277,7 @@ def create_provider(config: dict) -> EmbeddingProvider:
 
     Config examples:
       {"mode": "local", "model": "BAAI/bge-m3"}
+      {"mode": "fastembed", "model": "BAAI/bge-small-zh-v1.5"}
       {"mode": "api", "url": "https://api.openai.com/v1/embeddings",
        "key": "sk-...", "model": "text-embedding-3-small", "dim": 1536}
       {"mode": "default"}
@@ -216,6 +287,11 @@ def create_provider(config: dict) -> EmbeddingProvider:
     if mode == "local":
         return LocalEmbeddingProvider(
             model_name=config.get("model", "BAAI/bge-m3"),
+            cache_dir=config.get("cache_dir"),
+        )
+    elif mode == "fastembed":
+        return FastEmbedProvider(
+            model_name=config.get("model", "BAAI/bge-small-zh-v1.5"),
             cache_dir=config.get("cache_dir"),
         )
     elif mode == "api":
