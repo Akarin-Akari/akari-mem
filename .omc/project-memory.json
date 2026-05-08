@@ -1,0 +1,76 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1774455253287,
+  "projectRoot": "F:\\claude-tools\\akari-mem-mcp",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "pyproject.toml"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": "pytest",
+    "lintCommand": "ruff check",
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "data": {
+      "path": "data",
+      "purpose": "Data files",
+      "fileCount": 1,
+      "lastAccessed": 1774455253125,
+      "keyFiles": [
+        "akari-mem.db"
+      ]
+    },
+    "hooks": {
+      "path": "hooks",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1774455253128,
+      "keyFiles": [
+        "session-start.py",
+        "user-prompt.py"
+      ]
+    },
+    "__pycache__": {
+      "path": "__pycache__",
+      "purpose": null,
+      "fileCount": 9,
+      "lastAccessed": 1774455253130,
+      "keyFiles": [
+        "api_server.cpython-314.pyc",
+        "embeddings.cpython-310.pyc",
+        "embeddings.cpython-314.pyc",
+        "env_loader.cpython-314.pyc",
+        "migrate.cpython-314.pyc"
+      ]
+    }
+  },
+  "hotPaths": [],
+  "userDirectives": []
+}
