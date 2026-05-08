@@ -50,9 +50,8 @@
 
 ---
 
-### Phase 3: 提案 #2 — FastEmbed 轻量化 (待 Phase 1/2 验证后)
-
-> 中风险。替换 embedding 引擎，需验证向量质量不降级。
+### Phase 3: 提案 #2 — FastEmbed 轻量化
+> ✅ **已完成 (2026-05-08)**: 成功迁移至 FastEmbed，默认使用 `BAAI/bge-small-zh-v1.5` 与 `jinaai/jina-reranker-v2-base-multilingual`，体积与内存消耗大幅下降，本地推理速度显著提升。详见 Git 提交记录。
 
 #### [MODIFY] [embeddings.py](file:///f:/claude-tools/akari-mem-mcp/embeddings.py)
 - 新增 `FastEmbedProvider(EmbeddingProvider)` 类，基于 `fastembed` 库
@@ -69,6 +68,7 @@
 
 ### Phase 4: 提案 #4 — sqlite-vec 统一存储 (独立评估)
 
+> 🔍 **预研完成 (2026-05-08)**: 已输出可行性预研报告。详见 `docs/sqlite_vec_feasibility.md`。
 > 高风险大手术。完全替换 ChromaDB，需要数据迁移脚本。建议作为独立版本迭代，不在本轮实施。
 
 ---
