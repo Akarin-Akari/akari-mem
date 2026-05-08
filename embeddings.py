@@ -153,10 +153,11 @@ class DefaultEmbeddingProvider(EmbeddingProvider):
 
     def embed(self, texts: List[str]) -> List[List[float]]:
         self._load()
-        # ChromaDB v1.5.5: embed_query(str) -> List[float]
+        # Use __call__ (batch API) — embed_query has broken behavior in v1.5.5
+        raw = self._fn(texts)
         results = []
-        for text in texts:
-            vec = self._fn.embed_query(text)
+        for vec in raw:
+            # Ensure pure Python list[float] for ChromaDB Rust bindings
             if hasattr(vec, 'tolist'):
                 vec = vec.tolist()
             results.append(vec)
@@ -181,15 +182,19 @@ class ChromaEmbeddingAdapter:
         self.provider = provider
 
     def __call__(self, input: List[str]) -> List[List[float]]:
-        return self.provider.embed(input)
+        vecs = self.provider.embed(input)
+        # Ensure pure Python list for ChromaDB Rust bindings
+        return [v.tolist() if hasattr(v, 'tolist') else v for v in vecs]
 
     def embed_documents(self, documents: List[str]) -> List[List[float]]:
         """ChromaDB v1.x: embed documents for storage."""
-        return self.provider.embed(documents)
+        vecs = self.provider.embed(documents)
+        return [v.tolist() if hasattr(v, 'tolist') else v for v in vecs]
 
     def embed_query(self, input: str) -> List[float]:
         """ChromaDB v1.x: embed a single query for search."""
-        return self.provider.embed([input])[0]
+        vec = self.provider.embed([input])[0]
+        return vec.tolist() if hasattr(vec, 'tolist') else vec
 
     def name(self) -> str:
         """Required by ChromaDB to identify the embedding function."""

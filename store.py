@@ -170,56 +170,109 @@ class MemoryStore:
         db.commit()
         db.close()
 
-        # Sync to ChromaDB
-        document = f"{title}\n{text}"
-        self._collection.add(
-            ids=[f"mem_{mem_id}"],
-            documents=[document],
-            metadatas=[{
-                "sqlite_id": mem_id,
-                "title": title[:200],
-                "tags": tags,
-                "project": project,
-                "source": source,
-            }],
-        )
+        # Sync to ChromaDB with chunking
+        from chunker import chunk_text
 
-        logger.info(f"Saved memory #{mem_id}: {title[:40]}")
+        document = f"{title}\n{text}"
+        chunks = chunk_text(document)
+        base_meta = {
+            "sqlite_id": mem_id,
+            "title": title[:200],
+            "tags": tags,
+            "project": project,
+            "source": source,
+        }
+
+        if len(chunks) <= 1:
+            self._collection.add(
+                ids=[f"mem_{mem_id}"],
+                documents=[document],
+                metadatas=[{**base_meta, "chunk_index": 0, "total_chunks": 1}],
+            )
+        else:
+            ids = [f"mem_{mem_id}_chunk_{i}" for i in range(len(chunks))]
+            metas = [
+                {**base_meta, "chunk_index": i, "total_chunks": len(chunks)}
+                for i in range(len(chunks))
+            ]
+            self._collection.add(ids=ids, documents=chunks, metadatas=metas)
+
+        logger.info(f"Saved memory #{mem_id}: {title[:40]} ({len(chunks)} chunk(s))")
         return mem_id
 
-    def search(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        limit: int = 5,
+        project: Optional[str] = None,
+        tags: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
-        Hybrid search: vector + keyword + RRF fusion + optional rerank.
+        Hybrid search: vector + FTS5 keyword, merged via RRF.
+        If reranker is configured, re-scores the merged list.
+        Supports optional project/tags pre-filtering.
 
-        Stage 1a: ChromaDB vector search (semantic recall)
-        Stage 1b: FTS5 keyword search (exact keyword recall)
-        Stage 2:  RRF fusion (merge & deduplicate)
-        Stage 3:  Reranker re-scores (if enabled)
+        Returns list of memory dicts sorted by relevance.
         """
-        # How many candidates to fetch from each source
+        # Determine how many candidates to fetch
         fetch_k = limit * 3 if self._reranker else limit * 2
         fetch_k = max(fetch_k, 10)  # at least 10 candidates for good fusion
+
+        # Build ChromaDB where filter for metadata pre-filtering
+        chroma_where = None
+        where_clauses = []
+        if project:
+            where_clauses.append({"project": project})
+        if tags:
+            where_clauses.append({"tags": {"$contains": tags}})
+        if len(where_clauses) == 1:
+            chroma_where = where_clauses[0]
+        elif len(where_clauses) > 1:
+            chroma_where = {"$and": where_clauses}
 
         # ── Stage 1a: Vector recall ────────────────────────
         vector_results = []
         chroma_count = self._collection.count()
         if chroma_count > 0:
             query_vec = self._provider.embed([query])[0]
-            vr = self._collection.query(
-                query_embeddings=[query_vec],
-                n_results=min(fetch_k, chroma_count),
-            )
+            query_kwargs = {
+                "query_embeddings": [query_vec],
+                "n_results": min(fetch_k * 2, chroma_count),
+            }
+            if chroma_where:
+                query_kwargs["where"] = chroma_where
+            try:
+                vr = self._collection.query(**query_kwargs)
+            except Exception:
+                # Filter may fail if no matching docs — fallback to unfiltered
+                vr = self._collection.query(
+                    query_embeddings=[query_vec],
+                    n_results=min(fetch_k * 2, chroma_count),
+                )
             if vr["ids"] and vr["ids"][0]:
                 db = self._db()
+                # Chunk dedup: keep best distance per sqlite_id
+                seen_ids: Dict[int, float] = {}  # sqlite_id -> best_distance
+                candidates = []
                 for i, cid in enumerate(vr["ids"][0]):
                     meta = vr["metadatas"][0][i]
                     sqlite_id = meta.get("sqlite_id")
                     distance = vr["distances"][0][i] if vr["distances"] else None
+                    # Dedup: only keep the chunk with smallest distance
+                    if sqlite_id in seen_ids:
+                        if distance is not None and distance < seen_ids[sqlite_id]:
+                            seen_ids[sqlite_id] = distance
+                            candidates = [c for c in candidates if c["id"] != sqlite_id]
+                        else:
+                            continue
+                    else:
+                        seen_ids[sqlite_id] = distance if distance is not None else float("inf")
+
                     row = db.execute(
                         "SELECT * FROM memories WHERE id=?", (sqlite_id,)
                     ).fetchone()
                     if row:
-                        vector_results.append({
+                        candidates.append({
                             "id": row["id"],
                             "title": row["title"],
                             "text": row["text"],
@@ -230,9 +283,12 @@ class MemoryStore:
                             "distance": round(distance, 4) if distance else None,
                         })
                 db.close()
+                vector_results = candidates[:fetch_k]
 
         # ── Stage 1b: Keyword recall (FTS5) ────────────────
-        keyword_results = self._keyword_search_safe(query, fetch_k)
+        keyword_results = self._keyword_search_safe(
+            query, fetch_k, project=project, tags=tags
+        )
 
         # ── Stage 2: RRF Fusion ────────────────────────────
         merged = self._rrf_fusion(vector_results, keyword_results, k=60)
@@ -244,33 +300,45 @@ class MemoryStore:
 
         return merged[:limit]
 
-    def _keyword_search_safe(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    def _keyword_search_safe(
+        self,
+        query: str,
+        limit: int = 10,
+        project: Optional[str] = None,
+        tags: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
         FTS5 keyword search with graceful fallback.
         FTS5 MATCH syntax can fail on certain queries — fall back silently.
+        Supports optional project/tags pre-filtering.
         """
         db = self._db()
+
+        # Build optional SQL WHERE clause for metadata filtering
+        extra_where = ""
+        extra_params: list = []
+        if project:
+            extra_where += " AND m.project = ?"
+            extra_params.append(project)
+        if tags:
+            extra_where += " AND m.tags LIKE ?"
+            extra_params.append(f"%{tags}%")
+
+        base_sql = (
+            "SELECT m.* FROM memories m "
+            "JOIN memories_fts f ON m.id = f.rowid "
+            "WHERE memories_fts MATCH ?" + extra_where + " "
+            "ORDER BY rank LIMIT ?"
+        )
+
         try:
-            # Try exact FTS5 match first
-            rows = db.execute(
-                "SELECT m.* FROM memories m "
-                "JOIN memories_fts f ON m.id = f.rowid "
-                "WHERE memories_fts MATCH ? "
-                "ORDER BY rank LIMIT ?",
-                (query, limit),
-            ).fetchall()
+            rows = db.execute(base_sql, (query, *extra_params, limit)).fetchall()
         except Exception:
             # FTS5 syntax error — try splitting into OR terms
             try:
                 terms = [t.strip() for t in query.split() if t.strip()]
-                fts_query = " OR ".join(f'"{t}"' for t in terms)
-                rows = db.execute(
-                    "SELECT m.* FROM memories m "
-                    "JOIN memories_fts f ON m.id = f.rowid "
-                    "WHERE memories_fts MATCH ? "
-                    "ORDER BY rank LIMIT ?",
-                    (fts_query, limit),
-                ).fetchall()
+                fts_query = " OR ".join(f'"{ t}"' for t in terms)
+                rows = db.execute(base_sql, (fts_query, *extra_params, limit)).fetchall()
             except Exception:
                 rows = []
         db.close()
@@ -315,9 +383,15 @@ class MemoryStore:
 
         return result
 
-    def keyword_search(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    def keyword_search(
+        self,
+        query: str,
+        limit: int = 10,
+        project: Optional[str] = None,
+        tags: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Public keyword search (for MCP tool or direct use)."""
-        return self._keyword_search_safe(query, limit)
+        return self._keyword_search_safe(query, limit, project=project, tags=tags)
 
     def list_recent(self, limit: int = 10) -> List[Dict[str, Any]]:
         """List most recent memories."""
@@ -338,7 +412,7 @@ class MemoryStore:
         return dict(row) if row else None
 
     def delete(self, memory_id: int) -> bool:
-        """Delete from both SQLite and ChromaDB."""
+        """Delete from both SQLite and ChromaDB (including all chunks)."""
         db = self._db()
         cur = db.execute("DELETE FROM memories WHERE id=?", (memory_id,))
         db.commit()
@@ -346,10 +420,15 @@ class MemoryStore:
 
         if cur.rowcount > 0:
             try:
-                self._collection.delete(ids=[f"mem_{memory_id}"])
+                # Delete all chunks for this memory using metadata filter
+                self._collection.delete(where={"sqlite_id": memory_id})
             except Exception:
-                pass  # ChromaDB may not have it
-            logger.info(f"Deleted memory #{memory_id}")
+                # Fallback: try legacy single-id delete
+                try:
+                    self._collection.delete(ids=[f"mem_{memory_id}"])
+                except Exception:
+                    pass
+            logger.info(f"Deleted memory #{memory_id} (including chunks)")
             return True
         return False
 
@@ -378,8 +457,10 @@ class MemoryStore:
         }
 
     def rebuild_vectors(self):
-        """Re-embed all memories in ChromaDB. Use after changing embedding model."""
-        logger.info("Rebuilding vector index...")
+        """Re-embed all memories in ChromaDB with chunking. Use after changing embedding model."""
+        from chunker import chunk_text
+
+        logger.info("Rebuilding vector index (with chunking)...")
 
         # Delete all existing
         existing = self._collection.get()
@@ -391,24 +472,36 @@ class MemoryStore:
         rows = db.execute("SELECT * FROM memories ORDER BY id").fetchall()
         db.close()
 
-        batch_size = 10
-        for i in range(0, len(rows), batch_size):
-            batch = rows[i : i + batch_size]
-            self._collection.add(
-                ids=[f"mem_{r['id']}" for r in batch],
-                documents=[f"{r['title']}\n{r['text']}" for r in batch],
-                metadatas=[{
-                    "sqlite_id": r["id"],
-                    "title": r["title"][:200],
-                    "tags": r["tags"] or "",
-                    "project": r["project"] or "",
-                    "source": r["source"] or "",
-                } for r in batch],
-            )
-            logger.info(f"  Re-embedded batch {i // batch_size + 1}")
+        total_chunks = 0
+        for r in rows:
+            document = f"{r['title']}\n{r['text']}"
+            chunks = chunk_text(document)
+            base_meta = {
+                "sqlite_id": r["id"],
+                "title": r["title"][:200],
+                "tags": r["tags"] or "",
+                "project": r["project"] or "",
+                "source": r["source"] or "",
+            }
+
+            if len(chunks) <= 1:
+                self._collection.add(
+                    ids=[f"mem_{r['id']}"],
+                    documents=[document],
+                    metadatas=[{**base_meta, "chunk_index": 0, "total_chunks": 1}],
+                )
+            else:
+                ids = [f"mem_{r['id']}_chunk_{i}" for i in range(len(chunks))]
+                metas = [
+                    {**base_meta, "chunk_index": i, "total_chunks": len(chunks)}
+                    for i in range(len(chunks))
+                ]
+                self._collection.add(ids=ids, documents=chunks, metadatas=metas)
+
+            total_chunks += len(chunks)
 
         self._set_meta("embedding_model", self._provider.model_name)
         logger.info(
-            f"Rebuild complete: {len(rows)} memories re-embedded "
-            f"with {self._provider.model_name}"
+            f"Rebuild complete: {len(rows)} memories → {total_chunks} chunks "
+            f"re-embedded with {self._provider.model_name}"
         )

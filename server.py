@@ -183,6 +183,8 @@ def _save_to_sqlite(title, text, tags, project, source):
 
 def _index_worker():
     """Background thread: picks up saved memories and indexes them in ChromaDB."""
+    from chunker import chunk_text
+
     while True:
         item = _index_queue.get()
         if item is None:
@@ -191,18 +193,32 @@ def _index_worker():
         try:
             store = get_store()
             document = f"{title}\n{text}"
-            store._collection.add(
-                ids=[f"mem_{mem_id}"],
-                documents=[document],
-                metadatas=[{
-                    "sqlite_id": mem_id,
-                    "title": title[:200],
-                    "tags": tags,
-                    "project": project,
-                    "source": source,
-                }],
-            )
-            logger.info(f"Indexed memory #{mem_id} in ChromaDB.")
+            chunks = chunk_text(document)
+            base_meta = {
+                "sqlite_id": mem_id,
+                "title": title[:200],
+                "tags": tags,
+                "project": project,
+                "source": source,
+            }
+
+            if len(chunks) <= 1:
+                # Short text — single entry (backward compatible)
+                store._collection.add(
+                    ids=[f"mem_{mem_id}"],
+                    documents=[document],
+                    metadatas=[{**base_meta, "chunk_index": 0, "total_chunks": 1}],
+                )
+            else:
+                # Long text — multiple chunks
+                ids = [f"mem_{mem_id}_chunk_{i}" for i in range(len(chunks))]
+                metas = [
+                    {**base_meta, "chunk_index": i, "total_chunks": len(chunks)}
+                    for i in range(len(chunks))
+                ]
+                store._collection.add(ids=ids, documents=chunks, metadatas=metas)
+
+            logger.info(f"Indexed memory #{mem_id} in ChromaDB ({len(chunks)} chunk(s)).")
         except Exception as e:
             logger.exception(f"Failed to index memory #{mem_id}: {e}")
         _index_queue.task_done()
@@ -225,7 +241,9 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-async def quick_search(query: str, limit: int = 5) -> str:
+async def quick_search(
+    query: str, limit: int = 5, project: str = "", tags: str = ""
+) -> str:
     """
     Fast keyword search (FTS5). Millisecond-level, no model loading.
     Best for: exact name matching, specific terms, simple lookups.
@@ -234,35 +252,45 @@ async def quick_search(query: str, limit: int = 5) -> str:
     Args:
         query: Search keywords (space-separated, OR logic)
         limit: Max results (default 5)
+        project: Filter by project name (optional)
+        tags: Filter by tag keyword (optional)
     """
+    _project = project or None
+    _tags = tags or None
+
     def _impl():
         import sqlite3
         db_path = os.path.join(config["data_dir"], "akari-mem.db")
         if not os.path.exists(db_path):
             return "No memory database found."
 
+        # Build optional WHERE clause for metadata filtering
+        extra_where = ""
+        extra_params: list = []
+        if _project:
+            extra_where += " AND m.project = ?"
+            extra_params.append(_project)
+        if _tags:
+            extra_where += " AND m.tags LIKE ?"
+            extra_params.append(f"%{_tags}%")
+
+        base_sql = (
+            "SELECT m.* FROM memories m "
+            "JOIN memories_fts f ON m.id = f.rowid "
+            "WHERE memories_fts MATCH ?" + extra_where + " "
+            "ORDER BY rank LIMIT ?"
+        )
+
         db = sqlite3.connect(db_path)
         db.row_factory = sqlite3.Row
         try:
-            rows = db.execute(
-                "SELECT m.* FROM memories m "
-                "JOIN memories_fts f ON m.id = f.rowid "
-                "WHERE memories_fts MATCH ? "
-                "ORDER BY rank LIMIT ?",
-                (query, limit),
-            ).fetchall()
+            rows = db.execute(base_sql, (query, *extra_params, limit)).fetchall()
         except Exception:
             # FTS5 syntax error — split into OR terms
             terms = [t.strip() for t in query.split() if t.strip()]
             fts_q = " OR ".join(f'"{ t}"' for t in terms)
             try:
-                rows = db.execute(
-                    "SELECT m.* FROM memories m "
-                    "JOIN memories_fts f ON m.id = f.rowid "
-                    "WHERE memories_fts MATCH ? "
-                    "ORDER BY rank LIMIT ?",
-                    (fts_q, limit),
-                ).fetchall()
+                rows = db.execute(base_sql, (fts_q, *extra_params, limit)).fetchall()
             except Exception:
                 rows = []
         db.close()
@@ -281,7 +309,9 @@ async def quick_search(query: str, limit: int = 5) -> str:
 
 
 @mcp.tool()
-async def search_memory(query: str, limit: int = 5) -> str:
+async def search_memory(
+    query: str, limit: int = 5, project: str = "", tags: str = ""
+) -> str:
     """
     Deep hybrid search: vector(BGE-M3) + keyword(FTS5) + RRF fusion + rerank.
     Takes 5-15s on first call (model loading), ~1-3s after warm-up.
@@ -290,9 +320,14 @@ async def search_memory(query: str, limit: int = 5) -> str:
     Args:
         query: Natural language search query
         limit: Max results (default 5)
+        project: Filter by project name (optional)
+        tags: Filter by tag keyword (optional)
     """
+    _project = project or None
+    _tags = tags or None
+
     def _impl():
-        results = get_store().search(query, limit)
+        results = get_store().search(query, limit, project=_project, tags=_tags)
         if not results:
             return "No memories found."
 
