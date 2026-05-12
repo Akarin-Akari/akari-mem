@@ -22,6 +22,19 @@ logger = logging.getLogger("akari-mem.store")
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
 
+def _trace(msg: str) -> None:
+    """Append a timestamped line to data/warmup.log so we can pinpoint hangs
+    even when stdio is broken. Same file as the Step 1/2/3 markers."""
+    try:
+        import time as _t
+        _log_path = os.path.join(DEFAULT_DATA_DIR, "warmup.log")
+        with open(_log_path, "a", encoding="utf-8") as f:
+            f.write(f"[{_t.strftime('%H:%M:%S')}] [store] {msg}\n")
+            f.flush()
+    except Exception:
+        pass
+
+
 class MemoryStore:
     """Dual-engine memory store: SQLite + ChromaDB + optional Rerank."""
 
@@ -42,12 +55,19 @@ class MemoryStore:
         self._reranker = reranker
 
         # Init
+        _trace("Step 3a: _init_sqlite start")
         self._init_sqlite()
+        _trace("Step 3a: _init_sqlite done")
+        _trace("Step 3b: _init_chroma start")
         self._init_chroma()
+        _trace("Step 3b: _init_chroma done")
         rerank_info = f" | rerank={self._reranker.model_name}" if self._reranker else ""
+        _trace("Step 3c: probing provider.dimension (may trigger model _load)")
+        _dim = self._provider.dimension
+        _trace(f"Step 3c: dimension={_dim} done")
         logger.info(
             f"MemoryStore ready: {self.db_path} | "
-            f"embedding={self._provider.model_name} ({self._provider.dimension}d)"
+            f"embedding={self._provider.model_name} ({_dim}d)"
             f"{rerank_info}"
         )
 
@@ -96,11 +116,15 @@ class MemoryStore:
     # ── ChromaDB ────────────────────────────────────────────
 
     def _init_chroma(self):
+        _trace("  3b.1: import chromadb")
         import chromadb
 
+        _trace("  3b.2: PersistentClient() (may hang on telemetry/WAL)")
         self._chroma_client = chromadb.PersistentClient(path=self.chroma_dir)
+        _trace("  3b.2: PersistentClient done")
 
         # Check if existing collection uses different model
+        _trace("  3b.3: _get_meta(embedding_model)")
         existing_model = self._get_meta("embedding_model")
         current_model = self._provider.model_name
 
@@ -115,11 +139,13 @@ class MemoryStore:
             except Exception:
                 pass
 
+        _trace("  3b.4: get_or_create_collection (may probe embedding_function)")
         self._collection = self._chroma_client.get_or_create_collection(
             name="akari_memories",
             embedding_function=self._chroma_ef,
             metadata={"hnsw:space": "cosine"},
         )
+        _trace("  3b.4: get_or_create_collection done")
 
         self._set_meta("embedding_model", current_model)
 

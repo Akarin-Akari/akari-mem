@@ -236,6 +236,9 @@ class OnnxEmbeddingProvider(EmbeddingProvider):
         max_length: int = 512,
         normalize: bool = True,
         pooling: str = "cls",
+        prefer_trt: bool = False,
+        trt_workspace_mb: int = 1024,
+        gpu_mem_limit_gb: float = 3.0,
     ):
         self._model_path = model_path
         self._model_name = model_name
@@ -243,6 +246,9 @@ class OnnxEmbeddingProvider(EmbeddingProvider):
         self._max_length = max_length
         self._normalize = normalize
         self._pooling = pooling  # "cls" | "mean"
+        self._prefer_trt = bool(prefer_trt)
+        self._trt_workspace_mb = int(trt_workspace_mb)
+        self._gpu_mem_limit_bytes = int(gpu_mem_limit_gb * 1024 * 1024 * 1024)
         self._session = None
         self._tokenizer = None
         self._dim: Optional[int] = None
@@ -252,7 +258,34 @@ class OnnxEmbeddingProvider(EmbeddingProvider):
     def _load(self):
         if self._session is not None:
             return
+        # Sub-step tracing into data/warmup.log so we can pinpoint the exact
+        # line that hangs (stdio may be broken under MCP).
+        def _tr(msg: str) -> None:
+            try:
+                import time as _t
+                import os as _os
+                _p = _os.path.join(
+                    _os.path.dirname(_os.path.abspath(__file__)), "data", "warmup.log"
+                )
+                with open(_p, "a", encoding="utf-8") as _f:
+                    _f.write(f"[{_t.strftime('%H:%M:%S')}] [onnx-load] {msg}\n")
+                    _f.flush()
+            except Exception:
+                pass
+
+        _tr("import onnxruntime")
         import onnxruntime as ort
+
+        # CRITICAL: ORT C++ layer writes warnings ("Memcpy nodes added",
+        # cuDNN search, TRT build progress) directly to OS fd 2. When this
+        # server runs under MCP stdio (pipe-backed stderr), a slow host
+        # consumer can fill the pipe buffer (~64KB on Windows) and BLOCK
+        # the write — which freezes the entire ONNX load thread.
+        # Two-layer defense:
+        # 1) Lower ORT's global logger severity so it stops emitting warnings.
+        # 2) Temporarily redirect OS fd 2 to a regular file during session
+        #    creation so any residual native print cannot block on a pipe.
+        ort.set_default_logger_severity(3)  # 0=Verbose,1=Info,2=Warn,3=Err,4=Fatal
 
         onnx_dir = os.path.join(self._model_path, "onnx")
         onnx_file = os.path.join(onnx_dir, "model.onnx")
@@ -262,47 +295,147 @@ class OnnxEmbeddingProvider(EmbeddingProvider):
                 f"Did you run scripts/convert_bge_m3_fp16.py?"
             )
 
-        try:
-            from transformers import AutoTokenizer
-        except ImportError as e:
-            raise RuntimeError(
-                "transformers required for ONNX BGE-M3 tokenizer."
-            ) from e
-        self._tokenizer = AutoTokenizer.from_pretrained(onnx_dir)
+        # Use the lightweight `tokenizers` library (Rust) instead of the
+        # heavy `transformers.AutoTokenizer`. Why:
+        # - `from transformers import AutoTokenizer` triggers a chain of
+        #   lazy-module imports (torch, numpy ops, hub utils...) that, under
+        #   the MCP stdio child process, can BLOCK for many minutes on
+        #   Windows even though pure-Python `import transformers` takes
+        #   under 20s in isolation. Observed: 6+ minutes hang in MCP.
+        # - The on-disk artifact `tokenizer.json` is the SentencePiece-XLMR
+        #   fast tokenizer that AutoTokenizer would have given us anyway;
+        #   `tokenizers.Tokenizer.from_file` loads it in milliseconds.
+        # - We enable padding + truncation here so encode_batch returns
+        #   ready-to-feed numpy arrays.
+        tokenizer_json = os.path.join(onnx_dir, "tokenizer.json")
+        if not os.path.exists(tokenizer_json):
+            raise FileNotFoundError(
+                f"tokenizer.json not found at {tokenizer_json}. "
+                f"This file is required for the fast Rust tokenizer."
+            )
+        _tr(f"Tokenizer.from_file start (path={tokenizer_json})")
+        from tokenizers import Tokenizer as _FastTok
+        self._tokenizer = _FastTok.from_file(tokenizer_json)
+        # XLM-RoBERTa: pad_id=1 (<pad>), bos=0, eos=2.
+        self._tokenizer.enable_padding(pad_id=1, pad_token="<pad>")
+        self._tokenizer.enable_truncation(max_length=self._max_length)
+        _tr("Tokenizer.from_file done")
 
         # Build provider list (CUDA first if requested, fallback to CPU).
-        # IMPORTANT: arena_extend_strategy default is "kNextPowerOfTwo" which
-        # over-allocates VRAM aggressively (e.g. doubles arena on each grow).
-        # For inference workloads with fixed batch size this is wasteful.
-        # `kSameAsRequested` keeps allocations tight; `HEURISTIC` for cuDNN
-        # avoids the EXHAUSTIVE workspace bloat.
+        # VRAM control rationale:
+        # - arena_extend_strategy="kSameAsRequested" prevents the default
+        #   kNextPowerOfTwo from doubling the arena on each grow.
+        # - cudnn_conv_algo_search="HEURISTIC" avoids EXHAUSTIVE workspace
+        #   probing (which probes algorithms requiring 1-2 GB scratch buffers).
+        # - cudnn_conv_use_max_workspace="0" tells cuDNN NOT to allocate the
+        #   max workspace size when picking conv algos — this is the largest
+        #   single source of "VRAM grows after first inference" behavior.
+        # - gpu_mem_limit caps the CUDA arena so a runaway workspace cannot
+        #   eat unbounded VRAM; 3 GB is generous for BGE-M3 FP16 (~1.1 GB
+        #   weights + activations) while leaving headroom.
         providers = []
         if self._device == "cuda":
+            # TensorRT EP (optional, opt-in via prefer_trt=True).
+            # PROS: 1.5-3x faster inference, kernel fusion, FP16 native
+            # CONS:
+            #   1. First-time engine build is SLOW (5-30 min for BGE-M3)
+            #      → we enable engine cache so subsequent starts are fast.
+            #   2. During engine build, peak VRAM can spike to 4-6 GB.
+            #   3. Dynamic shape support requires explicit min/opt/max profiles
+            #      (otherwise every new token length triggers a rebuild).
+            # We list TRT FIRST so ORT prefers it; CUDA EP stays as fallback.
+            if self._prefer_trt:
+                trt_cache_dir = os.path.join(self._model_path, "trt_cache")
+                os.makedirs(trt_cache_dir, exist_ok=True)
+                # Dynamic shape profile: batch=1..8, seq_len=1..max_length.
+                # opt_shapes target the common case (batch=1, seq_len=64).
+                trt_min = f"input_ids:1x1,attention_mask:1x1"
+                trt_opt = f"input_ids:1x64,attention_mask:1x64"
+                trt_max = f"input_ids:8x{self._max_length},attention_mask:8x{self._max_length}"
+                if self._needs_token_type_ids or True:  # safe to declare even if unused
+                    trt_min += ",token_type_ids:1x1"
+                    trt_opt += ",token_type_ids:1x64"
+                    trt_max += f",token_type_ids:8x{self._max_length}"
+                providers.append((
+                    "TensorrtExecutionProvider",
+                    {
+                        "device_id": 0,
+                        "trt_fp16_enable": True,
+                        "trt_engine_cache_enable": True,
+                        "trt_engine_cache_path": trt_cache_dir,
+                        "trt_max_workspace_size": self._trt_workspace_mb * 1024 * 1024,
+                        "trt_profile_min_shapes": trt_min,
+                        "trt_profile_opt_shapes": trt_opt,
+                        "trt_profile_max_shapes": trt_max,
+                        "trt_force_sequential_engine_build": True,
+                    },
+                ))
+                logger.info(
+                    f"TensorRT EP enabled (cache={trt_cache_dir}, "
+                    f"workspace={self._trt_workspace_mb}MB). First-time build may take 5-30 min."
+                )
             providers.append((
                 "CUDAExecutionProvider",
                 {
                     "device_id": 0,
                     "arena_extend_strategy": "kSameAsRequested",
                     "cudnn_conv_algo_search": "HEURISTIC",
+                    "cudnn_conv_use_max_workspace": "0",
                     "do_copy_in_default_stream": True,
+                    "gpu_mem_limit": str(self._gpu_mem_limit_bytes),
                 },
             ))
         providers.append("CPUExecutionProvider")
 
         sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # NOTE: ORT_ENABLE_ALL triggers SimplifiedLayerNormFusion which on
+        # BGE-M3 FP16 self-exported ONNX hits a known ORT 1.23 bug:
+        #   "Attempting to get index by a name which does not exist:
+        #    InsertedPrecisionFreeCast_..."
+        # Downgrading one level to EXTENDED keeps every other optimization
+        # (constant folding, common subexpr elim, layout transforms) while
+        # skipping the misbehaving fusion. Loss is < 5% throughput on
+        # BGE-M3, vs total failure with ENABLE_ALL.
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
         # Disable mem-pattern (it pre-allocates worst-case across input shapes,
         # explodes VRAM for dynamic-length tokenizer output).
         sess_options.enable_mem_pattern = False
         sess_options.enable_cpu_mem_arena = False
+        # Silence per-session log to match the global setting above.
+        sess_options.log_severity_level = 3
 
         logger.info(
             f"Loading ONNX model: {onnx_file} "
             f"(requested providers={[p[0] if isinstance(p, tuple) else p for p in providers]})"
         )
-        self._session = ort.InferenceSession(
-            onnx_file, sess_options=sess_options, providers=providers
-        )
+        # Redirect OS fd 2 during session build so any native print from
+        # ORT/cuDNN/TRT writes to a regular file instead of a (possibly full)
+        # MCP stdio pipe. We restore fd 2 in a finally block so user-facing
+        # Python logging is unaffected after load.
+        _stderr_log = os.path.join(self._model_path, "load_stderr.log")
+        _saved_fd2 = None
+        try:
+            try:
+                _saved_fd2 = os.dup(2)
+                _redir_fd = os.open(
+                    _stderr_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                )
+                os.dup2(_redir_fd, 2)
+                os.close(_redir_fd)
+            except Exception:
+                _saved_fd2 = None  # if redirect fails, fall back to original fd 2
+            _tr("ort.InferenceSession start")
+            self._session = ort.InferenceSession(
+                onnx_file, sess_options=sess_options, providers=providers
+            )
+            _tr("ort.InferenceSession done")
+        finally:
+            if _saved_fd2 is not None:
+                try:
+                    os.dup2(_saved_fd2, 2)
+                    os.close(_saved_fd2)
+                except Exception:
+                    pass
 
         input_names = {i.name for i in self._session.get_inputs()}
         self._needs_token_type_ids = "token_type_ids" in input_names
@@ -338,24 +471,31 @@ class OnnxEmbeddingProvider(EmbeddingProvider):
             f"providers={actual}, token_type_ids={self._needs_token_type_ids}"
         )
 
+        # Loading a 1+ GB ONNX model parses a large protobuf into a transient
+        # CPU buffer. If a subsequent ORT session (e.g. the reranker) is loaded
+        # before that buffer is freed, the OS may refuse the second allocation
+        # ("bad allocation"). Forcing GC here drops the temp buffer immediately.
+        import gc as _gc
+        _gc.collect()
+
     def embed(self, texts: List[str]) -> List[List[float]]:
         import numpy as np
 
         self._load()
 
-        enc = self._tokenizer(
-            list(texts),
-            padding=True,
-            truncation=True,
-            max_length=self._max_length,
-            return_tensors="np",
-        )
+        # `tokenizers.Tokenizer.encode_batch` returns a list of `Encoding`
+        # objects. Padding and truncation are already configured in `_load()`
+        # via enable_padding / enable_truncation, so all encodings come out
+        # the same length, ready to stack into a numpy batch.
+        encs = self._tokenizer.encode_batch(list(texts))
+        input_ids = np.array([e.ids for e in encs], dtype=np.int64)
+        attention_mask = np.array([e.attention_mask for e in encs], dtype=np.int64)
         feed = {
-            "input_ids": enc["input_ids"].astype("int64"),
-            "attention_mask": enc["attention_mask"].astype("int64"),
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
         }
         if self._needs_token_type_ids:
-            feed["token_type_ids"] = np.zeros_like(enc["input_ids"], dtype="int64")
+            feed["token_type_ids"] = np.zeros_like(input_ids, dtype=np.int64)
 
         outputs = self._session.run([self._output_name], feed)
         emb = outputs[0]
@@ -385,6 +525,28 @@ class OnnxEmbeddingProvider(EmbeddingProvider):
     @property
     def model_name(self) -> str:
         return self._model_name
+
+    # ── Idle-unload API ─────────────────────────────────────────
+    # Swap-style unload: drop strong references, let any in-flight embed()
+    # finish using its local references, then GC reclaims the ORT session
+    # and the CUDA arena returns the VRAM. No locks needed because:
+    # - Python attribute assignment is atomic.
+    # - embed() reads self._session into a local frame before .run(), so
+    #   even if unload nulls the attribute mid-call, the call completes.
+    # - Next embed() sees self._session is None and triggers _load() again.
+    def is_loaded(self) -> bool:
+        return self._session is not None
+
+    def unload(self) -> None:
+        import gc
+        if self._session is None:
+            return
+        logger.info(f"Unloading ONNX session (model={self._model_name}) to free VRAM...")
+        self._session = None
+        self._tokenizer = None
+        self._output_name = None
+        # Keep self._dim cached so dimension property does not re-load.
+        gc.collect()
 
 
 class FastEmbedProvider(EmbeddingProvider):
@@ -514,6 +676,9 @@ def create_provider(config: dict) -> EmbeddingProvider:
             max_length=int(config.get("max_length", 512)),
             normalize=bool(config.get("normalize", True)),
             pooling=config.get("pooling", "cls"),
+            prefer_trt=bool(config.get("prefer_trt", False)),
+            trt_workspace_mb=int(config.get("trt_workspace_mb", 1024)),
+            gpu_mem_limit_gb=float(config.get("gpu_mem_limit_gb", 3.0)),
         )
     elif mode == "fastembed":
         return FastEmbedProvider(

@@ -189,22 +189,48 @@ class FastEmbedReranker(Reranker):
     Recommended: jinaai/jina-reranker-v2-base-multilingual
 
     Compared to LocalReranker (PyTorch): lower memory, faster CPU inference.
+
+    IMPORTANT: FastEmbed's TextCrossEncoder defaults to `cuda=Device.AUTO`,
+    which silently picks CUDA when a GPU is available. That would load the
+    Jina reranker onto the same GPU as the BGE-M3 ONNX session and balloon
+    VRAM by 2-3 GB per search. We force CPU here unless explicitly overridden
+    via `device='cuda'` in config.
     """
 
     def __init__(
         self,
         model_name: str = "jinaai/jina-reranker-v2-base-multilingual",
         cache_dir: Optional[str] = None,
+        device: str = "cpu",
     ):
         self._model_name = model_name
         self._cache_dir = cache_dir or os.environ.get(
             "AKARI_MODEL_CACHE", "F:/models/fastembed"
         )
+        self._device = (device or "cpu").lower()
         self._model = None
 
     def _load(self):
         if self._model is None:
-            logger.info(f"Loading FastEmbed reranker: {self._model_name} ...")
+            def _tr(msg: str) -> None:
+                try:
+                    import time as _t, os as _os
+                    _p = _os.path.join(
+                        _os.path.dirname(_os.path.abspath(__file__)), "data", "warmup.log"
+                    )
+                    with open(_p, "a", encoding="utf-8") as _f:
+                        _f.write(f"[{_t.strftime('%H:%M:%S')}] [rerank-load] {msg}\n")
+                        _f.flush()
+                except Exception:
+                    pass
+
+            use_cuda = self._device == "cuda"
+            _tr(f"start (model={self._model_name}, cuda={use_cuda})")
+            logger.info(
+                f"Loading FastEmbed reranker: {self._model_name} "
+                f"on device={'cuda' if use_cuda else 'cpu'} ..."
+            )
+            _tr("import fastembed.TextCrossEncoder")
             try:
                 from fastembed.rerank.cross_encoder import TextCrossEncoder
             except ImportError:
@@ -212,11 +238,19 @@ class FastEmbedReranker(Reranker):
                     "fastembed not installed. "
                     "Run: pip install fastembed"
                 )
+            _tr("TextCrossEncoder() start (may probe network or unpack ONNX)")
             self._model = TextCrossEncoder(
                 model_name=self._model_name,
                 cache_dir=self._cache_dir,
+                cuda=use_cuda,  # ← pin to CPU by default; opt-in for CUDA
             )
-            logger.info("FastEmbed reranker loaded.")
+            _tr("TextCrossEncoder() done")
+            # Drop protobuf temp buffer; protects subsequent session loads.
+            import gc as _gc
+            _gc.collect()
+            logger.info(
+                f"FastEmbed reranker loaded (device={'cuda' if use_cuda else 'cpu'})."
+            )
 
     def rerank(
         self, query: str, documents: List[Dict[str, Any]], top_k: int = 5
@@ -242,6 +276,18 @@ class FastEmbedReranker(Reranker):
     @property
     def model_name(self) -> str:
         return self._model_name
+
+    # ── Idle-unload API (swap-style; see embeddings.py for rationale) ──
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
+    def unload(self) -> None:
+        import gc
+        if self._model is None:
+            return
+        logger.info(f"Unloading FastEmbed reranker ({self._model_name})...")
+        self._model = None
+        gc.collect()
 
 
 class NoReranker(Reranker):
@@ -280,6 +326,7 @@ def create_reranker(config: dict) -> Reranker:
         return FastEmbedReranker(
             model_name=config.get("model", "jinaai/jina-reranker-v2-base-multilingual"),
             cache_dir=config.get("cache_dir"),
+            device=config.get("device", "cpu"),
         )
     elif mode == "api":
         return APIReranker(

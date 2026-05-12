@@ -8,6 +8,120 @@ Usage:
   python server.py --test             # Run quick search test
 """
 import os
+import sys
+
+# ── CRITICAL: Redirect OS-level stderr (fd 2) to a file BEFORE any imports ──
+# Background: When running under MCP stdio transport, sys.stderr is a pipe
+# to the host (Claude Code). Native libraries (ORT, cuDNN, TRT, transformers)
+# write warnings directly to OS fd 2. On Windows, the pipe buffer is ~64KB.
+# If the host doesn't consume fast enough, the write blocks — freezing the
+# warmup thread mid-load (observed: Step 3 hangs for 10-17 minutes).
+# Redirecting fd 2 to a regular file at startup eliminates this entirely
+# while still letting Python logging (which we redirect below) work.
+# Done before any other import so even import-time native warnings are safe.
+try:
+    _SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
+    _DATA_DIR = os.path.join(_SERVER_DIR, "data")
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    _STDERR_LOG = os.path.join(_DATA_DIR, "stderr.log")
+    _fd = os.open(_STDERR_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    os.dup2(_fd, 2)
+    os.close(_fd)
+    # Reattach Python's sys.stderr to the (now-file-backed) fd 2 so Python
+    # writes also go to the file rather than the original pipe.
+    sys.stderr = os.fdopen(2, "w", buffering=1, encoding="utf-8", errors="replace")
+except Exception:
+    # If redirect fails, fall back to the original pipe and pray.
+    pass
+
+# ── CRITICAL: Preload CUDA + cuDNN DLLs from PyTorch's bundled runtime ──
+# Why this exists:
+#   onnxruntime-gpu 1.23.x ships `onnxruntime_providers_cuda.dll` which
+#   depends on a TWO-MAJOR-VERSION mix of CUDA libs: cublas/cudart/cusparse
+#   use CUDA 12 (cublasLt64_12.dll, cudart64_12.dll), but cufft/cusolver use
+#   CUDA 11 (cufft64_11.dll, cusolver64_11.dll), plus cuDNN 9.x.
+#
+#   The PyTorch GPU wheel (`torch-X.Y.Z+cuXXX`) ships ALL of these under
+#   `<venv>/Lib/site-packages/torch/lib/` — a complete CUDA 12 + 11 + cuDNN 9
+#   runtime (~2 GB). Because it's vendored inside the venv, the user does
+#   NOT need to install system CUDA Toolkit or cuDNN. Everything just works
+#   as long as PyTorch's DLLs get loaded into the process BEFORE ORT tries
+#   to load its provider DLL.
+#
+# Why `os.add_dll_directory` is not enough:
+#   `add_dll_directory` only affects LoadLibrary calls that opt into
+#   `LOAD_LIBRARY_SEARCH_USER_DIRS`. When ORT's native loader pulls in
+#   `onnxruntime_providers_cuda.dll`, that DLL's own dependency resolution
+#   (cublasLt, cufft, cudnn, ...) follows Windows' default DLL search order,
+#   which does NOT consult user dirs. Result: silent fallback to CPUExecutionProvider
+#   (RAM blows up, VRAM stays at zero, embedding latency ~50s).
+#
+# Why explicit ctypes preload works:
+#   `ctypes.WinDLL(absolute_path)` loads the DLL into the process and pins
+#   it in memory under its base name. When ORT later asks Windows to resolve
+#   the same name as a transitive dependency, the loader sees it's already
+#   present and reuses the loaded module — no PATH search needed.
+#
+# Background — earlier behavior:
+#   Before we switched the reranker to fastembed-CPU, `import torch` happened
+#   first as part of the sentence-transformers reranker load path. PyTorch's
+#   own initialization preloads all these DLLs internally, so ORT inherited
+#   them "for free". After the reranker change, torch is never imported on
+#   the ORT load path, and the GPU silently dropped out.
+if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+    try:
+        import ctypes as _ctypes
+        _venv_site = os.path.join(
+            os.path.dirname(sys.executable), "..", "Lib", "site-packages"
+        )
+        _torch_lib = os.path.normpath(
+            os.path.join(_venv_site, "torch", "lib")
+        )
+        if os.path.isdir(_torch_lib):
+            # Register the directory so any subsequent LoadLibrary that DOES
+            # honor user dirs (Python's own ctypes / extension loaders) can
+            # find these DLLs by base name too.
+            try:
+                os.add_dll_directory(_torch_lib)
+            except Exception:
+                pass
+            # Preload order: low-level → high-level. Anything that depends on
+            # something else must come after its dependency.
+            _PRELOAD_DLLS = (
+                "cudart64_12.dll",
+                "nvrtc64_120_0.dll",
+                "nvrtc-builtins64_128.dll",
+                "nvJitLink_120_0.dll",
+                "cublas64_12.dll",
+                "cublasLt64_12.dll",
+                "cufft64_11.dll",
+                "cufftw64_11.dll",
+                "curand64_10.dll",
+                "cusparse64_12.dll",
+                "cusolver64_11.dll",
+                "cusolverMg64_11.dll",
+                "cudnn64_9.dll",
+                "cudnn_graph64_9.dll",
+                "cudnn_ops64_9.dll",
+                "cudnn_heuristic64_9.dll",
+                "cudnn_engines_precompiled64_9.dll",
+                "cudnn_engines_runtime_compiled64_9.dll",
+                "cudnn_cnn64_9.dll",
+                "cudnn_adv64_9.dll",
+            )
+            for _dll in _PRELOAD_DLLS:
+                _path = os.path.join(_torch_lib, _dll)
+                if os.path.exists(_path):
+                    try:
+                        _ctypes.WinDLL(_path)
+                    except OSError:
+                        # Missing or version-skewed DLL — ORT will report a
+                        # clearer error later when it tries to use it.
+                        pass
+    except Exception:
+        # Any failure here = ORT will fall back to CPU EP, which still works
+        # (just slower). We don't want to crash server startup over this.
+        pass
 
 # ── CRITICAL: Silence model loading output BEFORE any imports ────
 # MCP uses stdio pipes. Model loading (HF, tqdm, transformers) writes
@@ -17,8 +131,13 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", os.environ.get("AKARI_MODEL_CACHE", ""))
+# Force pure-offline mode for HuggingFace libraries. Even with local model
+# files, `from_pretrained()` will (by default) make a HEAD request to verify
+# freshness. Slow/blocked huggingface.co or hf-mirror.com hangs warmup for
+# minutes. These two vars short-circuit ALL network probes.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
-import sys
 import json
 import asyncio
 import logging
@@ -60,22 +179,52 @@ from tokenizer import tokenize_for_fts, tokenize_query
 # These imports trigger grpc/protobuf/tqdm/CUDA init that writes to
 # stdout/stderr. If done inside the warmup thread (after MCP starts),
 # the output fills the pipe buffer and blocks the thread forever.
+#
+# IMPORTANT: Only pre-import what the configured backends actually need.
+# Pre-importing torch under ONNX+FastEmbed mode wastes ~0.5-1 GB of VRAM
+# on PyTorch's CUDA context (cuBLAS/cuDNN lazy load), even though no
+# PyTorch model is ever loaded.
 try:
     import chromadb  # noqa: F401 — grpc/protobuf init writes to stderr
 except ImportError:
     pass
-try:
-    import sentence_transformers  # noqa: F401 — tqdm/transformers logging
-except ImportError:
-    pass
-try:
-    import torch  # noqa: F401 — CUDA init output
-except ImportError:
-    pass
+
+def _peek_mode(section: str) -> str:
+    """Read mode from config.json without triggering full config load."""
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as _f:
+                _cfg = json.load(_f)
+            return str(_cfg.get(section, {}).get("mode", "")).lower()
+    except Exception:
+        pass
+    return ""
+
+# CONFIG_PATH is defined below; resolve it inline here to avoid forward ref
+CONFIG_PATH = os.path.join(_PROJECT_ROOT, "config.json")
+
+_emb_mode = _peek_mode("embedding")
+_rnk_mode = _peek_mode("rerank")
+_needs_torch = _emb_mode == "local" or _rnk_mode == "local"
+
+if _needs_torch:
+    try:
+        import sentence_transformers  # noqa: F401 — tqdm/transformers logging
+    except ImportError:
+        pass
+    try:
+        import torch  # noqa: F401 — CUDA init output
+    except ImportError:
+        pass
+else:
+    logger_msg = (
+        f"Skipped torch/sentence_transformers preload "
+        f"(embedding.mode={_emb_mode or '<unset>'}, rerank.mode={_rnk_mode or '<unset>'})"
+    )
+    # logger not yet configured, defer to first MCP startup log
+    sys.stderr.write(f"[akari-mem] {logger_msg}\n")
 
 # ── Config ──────────────────────────────────────────────────
-
-CONFIG_PATH = os.path.join(_PROJECT_ROOT, "config.json")
 
 def load_config() -> dict:
     """Load config from config.json + env vars."""
@@ -112,10 +261,159 @@ _warmup_state = "idle"   # idle → loading → ready | failed
 _warmup_error = None
 _index_queue = _queue_mod.Queue()  # items: (mem_id, title, text, tags, project, source)
 
-def get_store():
+# Concurrency control for deep search (vector + rerank).
+# Created lazily on first MCP request so it binds to the running event loop.
+# Why a semaphore here (not a threading.Lock inside embed/rerank)?
+# - Lock inside model libs caused deadlocks last time (FastEmbed has its own
+#   thread pool, re-entrant LSP-style calls into Lock fail).
+# - Semaphore(1) at the MCP tool layer guarantees only ONE deep search
+#   touches the ONNX session at a time, with zero coupling to model internals.
+_deep_search_sem = None  # type: ignore[assignment]
+
+def _get_deep_search_sem():
+    """Lazy-create the semaphore so it binds to the active asyncio loop."""
+    global _deep_search_sem
+    if _deep_search_sem is None:
+        _deep_search_sem = asyncio.Semaphore(1)
+    return _deep_search_sem
+
+
+# ── Idle-Unload Watchdog ─────────────────────────────────────
+# Frees model memory after a period of inactivity. Designed to:
+# 1. NOT take any lock that user-facing code might also hold.
+# 2. Use swap-style unload (model providers null their refs); inflight
+#    requests keep working via local references, GC reclaims later.
+# 3. Re-load on next request is transparent (providers are lazy-loaded).
+
+class IdleUnloadManager:
+    def __init__(self, idle_timeout_seconds: float = 600.0, check_interval: float = 60.0):
+        self.idle_timeout = idle_timeout_seconds
+        self.check_interval = check_interval
+        self._last_activity = 0.0  # 0 means "no activity yet, do not unload"
+        self._lock = threading.Lock()  # protects _last_activity only — no model code holds this
+        self._targets = []  # list of (name, get_provider_fn)
+        self._stop = threading.Event()
+        self._thread = None
+        self.enabled = True
+
+    def register(self, name: str, get_provider_fn):
+        """Register a model provider. `get_provider_fn()` returns the provider
+        object (or None if store not yet built). Provider must expose
+        `is_loaded()` and `unload()` (swap-style)."""
+        self._targets.append((name, get_provider_fn))
+
+    def touch(self):
+        """Mark recent activity. Called from MCP search/save handlers."""
+        import time
+        with self._lock:
+            self._last_activity = time.monotonic()
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="idle-unload-watchdog"
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _loop(self):
+        import time
+        # Wait for at least one activity before starting the idle clock —
+        # avoids unloading the freshly warmed-up model that nobody has used yet.
+        while not self._stop.wait(self.check_interval):
+            if not self.enabled:
+                continue
+            with self._lock:
+                last = self._last_activity
+            if last == 0.0:
+                continue  # no activity recorded yet
+            idle_for = time.monotonic() - last
+            if idle_for < self.idle_timeout:
+                continue
+            # Unload each registered target if loaded.
+            for name, get_provider in self._targets:
+                try:
+                    p = get_provider()
+                    if p is None:
+                        continue
+                    if hasattr(p, "is_loaded") and p.is_loaded():
+                        logger.info(
+                            f"[idle-unload] {name} idle for {idle_for:.0f}s "
+                            f"(>{self.idle_timeout:.0f}s), unloading"
+                        )
+                        p.unload()
+                except Exception as e:
+                    logger.warning(f"[idle-unload] failed to unload {name}: {e}")
+            # Reset last_activity so we don't spam unload attempts.
+            with self._lock:
+                self._last_activity = 0.0
+
+
+# Read idle-unload config (with sensible defaults)
+def _idle_unload_config() -> dict:
+    cfg = config.get("idle_unload", {}) if isinstance(config, dict) else {}
+    return {
+        "enabled": bool(cfg.get("enabled", True)),
+        "timeout_seconds": float(cfg.get("timeout_seconds", 600.0)),
+        "targets": list(cfg.get("targets", ["reranker", "embedding"])),
+    }
+
+_iu_cfg = _idle_unload_config()
+_unload_mgr = IdleUnloadManager(
+    idle_timeout_seconds=_iu_cfg["timeout_seconds"],
+    check_interval=min(60.0, _iu_cfg["timeout_seconds"] / 10.0),
+)
+_unload_mgr.enabled = _iu_cfg["enabled"]
+
+def _register_unload_targets():
+    """Register embedding/reranker providers based on config."""
+    targets = _iu_cfg["targets"]
+    if "embedding" in targets:
+        _unload_mgr.register(
+            "embedding",
+            lambda: (_store._provider if _store is not None else None),
+        )
+    if "reranker" in targets:
+        _unload_mgr.register(
+            "reranker",
+            lambda: (_store._reranker if _store is not None else None),
+        )
+
+def get_store(timeout: float = 60.0):
+    """
+    Get the global MemoryStore. Race-safe vs background warmup:
+
+    1. Fast path: store already built → return immediately
+    2. If warmup is in progress → wait for it (up to `timeout` s) to avoid
+       constructing a second MemoryStore (which would re-load ONNX session,
+       double VRAM usage, and trigger SQLite WAL contention).
+    3. Fallback: warmup failed or never started → construct under _store_lock.
+    """
     global _store
     if _store is not None:
         return _store
+
+    # If warmup is loading, wait for it. This is the critical fix:
+    # without it, the first incoming MCP request races warmup and both
+    # try to construct a MemoryStore concurrently.
+    if _warmup_state == "loading":
+        import time as _t
+        deadline = _t.time() + timeout
+        while _store is None and _warmup_state == "loading":
+            if _t.time() > deadline:
+                logger.warning(
+                    f"get_store: warmup did not finish within {timeout}s, "
+                    f"falling back to synchronous construction"
+                )
+                break
+            _t.sleep(0.05)
+        if _store is not None:
+            return _store
+
+    # Fallback: warmup never ran, failed, or timed out.
     with _store_lock:
         if _store is None:
             p = create_provider(config.get("embedding", {}))
@@ -199,6 +497,12 @@ def _index_worker():
             break  # shutdown signal
         mem_id, title, text, tags, project, source = item
         try:
+            # Reset idle-unload timer so the embedding model stays hot
+            # while there are pending index jobs.
+            try:
+                _unload_mgr.touch()
+            except Exception:
+                pass
             store = get_store()
             document = f"{title}\n{text}"
             chunks = chunk_text(document)
@@ -339,6 +643,11 @@ async def search_memory(
     _tags = tags or None
 
     def _impl():
+        # touch idle-unload watchdog (so frequent searches keep models hot)
+        try:
+            _unload_mgr.touch()  # noqa: F821 — defined below
+        except Exception:
+            pass
         results = get_store().search(query, limit, project=_project, tags=_tags)
         if not results:
             return "No memories found."
@@ -353,7 +662,11 @@ async def search_memory(
             lines.append(f"  {preview}...")
         return "\n".join(lines)
 
-    return await asyncio.to_thread(_impl)
+    # Serialize deep searches at the MCP layer to prevent concurrent ONNX
+    # inference / rerank from doubling VRAM. This is the safe replacement
+    # for the old per-provider threading.Lock that caused deadlocks.
+    async with _get_deep_search_sem():
+        return await asyncio.to_thread(_impl)
 
 
 @mcp.tool()
@@ -408,6 +721,12 @@ async def save_memory(title: str, text: str, tags: str = "", project: str = "") 
     mem_id = await asyncio.to_thread(
         _save_to_sqlite, title, text, tags, project, "mcp"
     )
+    # save_memory enqueues background indexing which DOES touch the embedding
+    # model, so reset the idle-unload timer to keep models hot.
+    try:
+        _unload_mgr.touch()
+    except Exception:
+        pass
     # Queue background indexing (ChromaDB embedding) — non-blocking
     _index_queue.put((mem_id, title, text, tags, project, "mcp"))
     pending = _index_queue.qsize()
@@ -555,6 +874,15 @@ def main():
     # Start background workers
     threading.Thread(target=_background_warmup, daemon=True, name="warmup").start()
     threading.Thread(target=_index_worker, daemon=True, name="indexer").start()
+
+    # Start idle-unload watchdog (frees model VRAM/RAM after inactivity)
+    if _iu_cfg["enabled"]:
+        _register_unload_targets()
+        _unload_mgr.start()
+        logger.info(
+            f"Idle-unload watchdog started: timeout={_iu_cfg['timeout_seconds']:.0f}s, "
+            f"targets={_iu_cfg['targets']}"
+        )
 
     # Start MCP stdio server
     mcp.run(transport="stdio")

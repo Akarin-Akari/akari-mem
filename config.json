@@ -6,11 +6,20 @@
         "device": "cuda",
         "max_length": 512,
         "normalize": true,
-        "pooling": "cls"
+        "pooling": "cls",
+        "prefer_trt": false,
+        "trt_workspace_mb": 1024,
+        "gpu_mem_limit_gb": 3.0
     },
     "rerank": {
         "mode": "fastembed",
-        "model": "jinaai/jina-reranker-v2-base-multilingual"
+        "model": "jinaai/jina-reranker-v2-base-multilingual",
+        "device": "cpu"
+    },
+    "idle_unload": {
+        "enabled": true,
+        "timeout_seconds": 600,
+        "targets": ["reranker", "embedding"]
     },
     "log_level": "INFO"
 }
