@@ -1,8 +1,12 @@
 {
     "embedding": {
-        "mode": "local",
+        "mode": "onnx",
         "model": "BAAI/bge-m3",
-        "device": "cuda"
+        "model_path": "F:/models/bge-m3-onnx-fp16",
+        "device": "cuda",
+        "max_length": 512,
+        "normalize": true,
+        "pooling": "cls"
     },
     "rerank": {
         "mode": "fastembed",

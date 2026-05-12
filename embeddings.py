@@ -1,11 +1,12 @@
 """
 Embedding providers for akari-mem-mcp.
 
-Supports 4 modes:
+Supports 5 modes:
 1. LOCAL     — sentence-transformers (BGE-M3, etc.), best quality
-2. FASTEMBED — ONNX-based FastEmbed (BGE-M3, etc.), lightweight & fast
-3. API       — OpenAI-compatible embedding API, zero local resources
-4. DEFAULT   — ChromaDB built-in (all-MiniLM-L6-v2), fallback
+2. ONNX      — onnxruntime-gpu (BGE-M3 FP16), best VRAM/speed balance
+3. FASTEMBED — ONNX-based FastEmbed (BGE-small, etc.), lightweight
+4. API       — OpenAI-compatible embedding API, zero local resources
+5. DEFAULT   — ChromaDB built-in (all-MiniLM-L6-v2), fallback
 """
 import os
 import json
@@ -212,6 +213,180 @@ class DefaultEmbeddingProvider(EmbeddingProvider):
         return "all-MiniLM-L6-v2"
 
 
+class OnnxEmbeddingProvider(EmbeddingProvider):
+    """
+    ONNX-based embedding via onnxruntime (CUDA EP / CPU EP).
+
+    Designed for BGE-M3 ONNX FP16 (self-converted) to minimize VRAM usage
+    while keeping retrieval quality essentially unchanged vs PyTorch FP32.
+
+    Expected layout under `model_path`:
+        <model_path>/onnx/model.onnx              (graph)
+        <model_path>/onnx/model.onnx_data         (external weights)
+        <model_path>/onnx/tokenizer.json
+        <model_path>/onnx/sentencepiece.bpe.model
+        <model_path>/onnx/tokenizer_config.json
+    """
+
+    def __init__(
+        self,
+        model_path: str = "F:/models/bge-m3-onnx-fp16",
+        model_name: str = "BAAI/bge-m3",
+        device: str = "cuda",
+        max_length: int = 512,
+        normalize: bool = True,
+        pooling: str = "cls",
+    ):
+        self._model_path = model_path
+        self._model_name = model_name
+        self._device = device
+        self._max_length = max_length
+        self._normalize = normalize
+        self._pooling = pooling  # "cls" | "mean"
+        self._session = None
+        self._tokenizer = None
+        self._dim: Optional[int] = None
+        self._output_name: Optional[str] = None
+        self._needs_token_type_ids: bool = False
+
+    def _load(self):
+        if self._session is not None:
+            return
+        import onnxruntime as ort
+
+        onnx_dir = os.path.join(self._model_path, "onnx")
+        onnx_file = os.path.join(onnx_dir, "model.onnx")
+        if not os.path.exists(onnx_file):
+            raise FileNotFoundError(
+                f"ONNX model file not found: {onnx_file}. "
+                f"Did you run scripts/convert_bge_m3_fp16.py?"
+            )
+
+        try:
+            from transformers import AutoTokenizer
+        except ImportError as e:
+            raise RuntimeError(
+                "transformers required for ONNX BGE-M3 tokenizer."
+            ) from e
+        self._tokenizer = AutoTokenizer.from_pretrained(onnx_dir)
+
+        # Build provider list (CUDA first if requested, fallback to CPU).
+        # IMPORTANT: arena_extend_strategy default is "kNextPowerOfTwo" which
+        # over-allocates VRAM aggressively (e.g. doubles arena on each grow).
+        # For inference workloads with fixed batch size this is wasteful.
+        # `kSameAsRequested` keeps allocations tight; `HEURISTIC` for cuDNN
+        # avoids the EXHAUSTIVE workspace bloat.
+        providers = []
+        if self._device == "cuda":
+            providers.append((
+                "CUDAExecutionProvider",
+                {
+                    "device_id": 0,
+                    "arena_extend_strategy": "kSameAsRequested",
+                    "cudnn_conv_algo_search": "HEURISTIC",
+                    "do_copy_in_default_stream": True,
+                },
+            ))
+        providers.append("CPUExecutionProvider")
+
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # Disable mem-pattern (it pre-allocates worst-case across input shapes,
+        # explodes VRAM for dynamic-length tokenizer output).
+        sess_options.enable_mem_pattern = False
+        sess_options.enable_cpu_mem_arena = False
+
+        logger.info(
+            f"Loading ONNX model: {onnx_file} "
+            f"(requested providers={[p[0] if isinstance(p, tuple) else p for p in providers]})"
+        )
+        self._session = ort.InferenceSession(
+            onnx_file, sess_options=sess_options, providers=providers
+        )
+
+        input_names = {i.name for i in self._session.get_inputs()}
+        self._needs_token_type_ids = "token_type_ids" in input_names
+
+        # Pick output: prefer dense embedding (1024) or pooler_output
+        outputs = self._session.get_outputs()
+        preferred_names = ("sentence_embedding", "pooler_output", "dense_vecs")
+        for o in outputs:
+            if o.name in preferred_names:
+                self._output_name = o.name
+                shape_last = o.shape[-1] if o.shape else None
+                self._dim = shape_last if isinstance(shape_last, int) else 1024
+                break
+        if self._output_name is None:
+            # Fallback: scan for a 2D output with last dim == 1024
+            for o in outputs:
+                if (
+                    len(o.shape) == 2
+                    and isinstance(o.shape[-1], int)
+                    and o.shape[-1] == 1024
+                ):
+                    self._output_name = o.name
+                    self._dim = 1024
+                    break
+        if self._output_name is None:
+            # Last resort: take last_hidden_state and we'll pool ourselves
+            self._output_name = outputs[0].name
+            self._dim = 1024
+
+        actual = self._session.get_providers()
+        logger.info(
+            f"ONNX session ready: dim={self._dim}, output='{self._output_name}', "
+            f"providers={actual}, token_type_ids={self._needs_token_type_ids}"
+        )
+
+    def embed(self, texts: List[str]) -> List[List[float]]:
+        import numpy as np
+
+        self._load()
+
+        enc = self._tokenizer(
+            list(texts),
+            padding=True,
+            truncation=True,
+            max_length=self._max_length,
+            return_tensors="np",
+        )
+        feed = {
+            "input_ids": enc["input_ids"].astype("int64"),
+            "attention_mask": enc["attention_mask"].astype("int64"),
+        }
+        if self._needs_token_type_ids:
+            feed["token_type_ids"] = np.zeros_like(enc["input_ids"], dtype="int64")
+
+        outputs = self._session.run([self._output_name], feed)
+        emb = outputs[0]
+
+        # If we got last_hidden_state (shape [B, T, H]), apply pooling
+        if emb.ndim == 3:
+            if self._pooling == "mean":
+                mask = feed["attention_mask"][..., None].astype("float32")
+                emb = (emb * mask).sum(axis=1) / np.clip(mask.sum(axis=1), 1e-9, None)
+            else:  # cls
+                emb = emb[:, 0, :]
+
+        emb = emb.astype("float32")
+        if self._normalize:
+            norms = np.linalg.norm(emb, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            emb = emb / norms
+
+        return emb.tolist()
+
+    @property
+    def dimension(self) -> int:
+        if self._dim is None:
+            self._load()
+        return self._dim  # type: ignore
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+
 class FastEmbedProvider(EmbeddingProvider):
     """
     Lightweight ONNX-based embedding via FastEmbed (by Qdrant).
@@ -316,6 +491,8 @@ def create_provider(config: dict) -> EmbeddingProvider:
 
     Config examples:
       {"mode": "local", "model": "BAAI/bge-m3"}
+      {"mode": "onnx", "model_path": "F:/models/bge-m3-onnx-fp16",
+       "model": "BAAI/bge-m3", "device": "cuda"}
       {"mode": "fastembed", "model": "BAAI/bge-small-zh-v1.5"}
       {"mode": "api", "url": "https://api.openai.com/v1/embeddings",
        "key": "sk-...", "model": "text-embedding-3-small", "dim": 1536}
@@ -328,6 +505,15 @@ def create_provider(config: dict) -> EmbeddingProvider:
             model_name=config.get("model", "BAAI/bge-m3"),
             cache_dir=config.get("cache_dir"),
             device=config.get("device"),
+        )
+    elif mode == "onnx":
+        return OnnxEmbeddingProvider(
+            model_path=config.get("model_path", "F:/models/bge-m3-onnx-fp16"),
+            model_name=config.get("model", "BAAI/bge-m3"),
+            device=config.get("device", "cuda"),
+            max_length=int(config.get("max_length", 512)),
+            normalize=bool(config.get("normalize", True)),
+            pooling=config.get("pooling", "cls"),
         )
     elif mode == "fastembed":
         return FastEmbedProvider(

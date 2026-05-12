@@ -1,0 +1,44 @@
+"""Measure REAL VRAM usage of ONNX FP16 BGE-M3 via nvidia-smi."""
+import os
+import sys
+import time
+import subprocess
+
+os.environ.setdefault("HF_HOME", "F:/tmp/hf-cache")
+os.environ.setdefault("AKARI_MODEL_CACHE", "F:/models")
+sys.path.insert(0, "F:/claude-tools/akari-mem-mcp")
+
+
+def nvidia_smi_mb() -> float:
+    out = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+        encoding="utf-8",
+    )
+    return float(out.strip().splitlines()[0])
+
+
+def main():
+    print(f"[t=0]    baseline VRAM: {nvidia_smi_mb():.0f} MB")
+
+    from embeddings import OnnxEmbeddingProvider
+    print(f"[t=after imports]      VRAM: {nvidia_smi_mb():.0f} MB")
+
+    p = OnnxEmbeddingProvider(
+        model_path="F:/models/bge-m3-onnx-fp16",
+        model_name="BAAI/bge-m3",
+        device="cuda",
+    )
+    # Force load
+    _ = p.embed(["warm-up text 1", "warm-up text 2"])
+    time.sleep(1)
+    print(f"[t=after ONNX load+1] VRAM: {nvidia_smi_mb():.0f} MB")
+
+    # Larger batch
+    texts = ["sample text " + str(i) for i in range(32)]
+    _ = p.embed(texts)
+    time.sleep(1)
+    print(f"[t=after batch 32]    VRAM: {nvidia_smi_mb():.0f} MB")
+
+
+if __name__ == "__main__":
+    main()
