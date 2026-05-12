@@ -1,11 +1,12 @@
 {
     "embedding": {
         "mode": "local",
-        "model": "BAAI/bge-m3"
+        "model": "BAAI/bge-m3",
+        "device": "cuda"
     },
     "rerank": {
-        "mode": "local",
-        "model": "BAAI/bge-reranker-v2-m3"
+        "mode": "fastembed",
+        "model": "jinaai/jina-reranker-v2-base-multilingual"
     },
     "log_level": "INFO"
 }

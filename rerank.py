@@ -55,16 +55,34 @@ class LocalReranker(Reranker):
         self,
         model_name: str = "BAAI/bge-reranker-v2-m3",
         cache_dir: Optional[str] = None,
+        device: Optional[str] = None,
     ):
         self._model_name = model_name
         self._cache_dir = cache_dir or os.environ.get(
             "HF_HOME", None
         )
+        self._device = device  # None = auto-detect
         self._model = None
+
+    def _resolve_device(self) -> str:
+        """Resolve device: explicit > env > auto-detect (CUDA > CPU)."""
+        if self._device and self._device != "auto":
+            return self._device
+        env_device = os.environ.get("AKARI_DEVICE")
+        if env_device:
+            return env_device
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return "cuda"
+        except ImportError:
+            pass
+        return "cpu"
 
     def _load(self):
         if self._model is None:
-            logger.info(f"Loading reranker model: {self._model_name} ...")
+            device = self._resolve_device()
+            logger.info(f"Loading reranker model: {self._model_name} on device={device} ...")
             try:
                 from sentence_transformers import CrossEncoder
             except ImportError:
@@ -73,9 +91,9 @@ class LocalReranker(Reranker):
                     "Run: pip install sentence-transformers"
                 )
             self._model = CrossEncoder(
-                self._model_name, cache_folder=self._cache_dir
+                self._model_name, cache_folder=self._cache_dir, device=device
             )
-            logger.info("Reranker model loaded.")
+            logger.info(f"Reranker model loaded on device={device}.")
 
     def rerank(
         self, query: str, documents: List[Dict[str, Any]], top_k: int = 5
@@ -256,6 +274,7 @@ def create_reranker(config: dict) -> Reranker:
         return LocalReranker(
             model_name=config.get("model", "BAAI/bge-reranker-v2-m3"),
             cache_dir=config.get("cache_dir"),
+            device=config.get("device"),
         )
     elif mode == "fastembed":
         return FastEmbedReranker(

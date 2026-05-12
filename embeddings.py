@@ -42,17 +42,52 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         self,
         model_name: str = "BAAI/bge-m3",
         cache_dir: Optional[str] = None,
+        device: Optional[str] = None,
     ):
         self._model_name = model_name
         self._cache_dir = cache_dir or os.environ.get(
             "AKARI_MODEL_CACHE", "F:/models"
         )
+        self._device = device  # None = auto-detect
         self._model = None
         self._dim: Optional[int] = None
 
+    def _resolve_device(self) -> str:
+        """Resolve device: explicit > env > auto-detect (CUDA > CPU)."""
+        if self._device and self._device != "auto":
+            return self._device
+        env_device = os.environ.get("AKARI_DEVICE")
+        if env_device:
+            return env_device
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return "cuda"
+        except ImportError:
+            pass
+        return "cpu"
+
+    def _resolve_dtype(self, device: str):
+        """Pick optimal dtype for the device: BF16 > FP16 > FP32."""
+        if device != "cuda":
+            return None  # CPU stays FP32
+        try:
+            import torch
+            if torch.cuda.is_bf16_supported():
+                logger.info("Using BF16 (Blackwell/Ampere native)")
+                return torch.bfloat16
+            else:
+                logger.info("BF16 not supported, falling back to FP16")
+                return torch.float16
+        except Exception:
+            return None
+
     def _load(self):
         if self._model is None:
-            logger.info(f"Loading local model: {self._model_name} ...")
+            device = self._resolve_device()
+            dtype = self._resolve_dtype(device)
+            dtype_name = str(dtype).split(".")[-1] if dtype else "fp32"
+            logger.info(f"Loading local model: {self._model_name} on device={device}, dtype={dtype_name} ...")
             try:
                 from sentence_transformers import SentenceTransformer
             except ImportError:
@@ -60,11 +95,15 @@ class LocalEmbeddingProvider(EmbeddingProvider):
                     "sentence-transformers not installed. "
                     "Run: pip install sentence-transformers"
                 )
+            model_kwargs = {}
+            if dtype is not None:
+                model_kwargs["torch_dtype"] = dtype
             self._model = SentenceTransformer(
-                self._model_name, cache_folder=self._cache_dir
+                self._model_name, cache_folder=self._cache_dir, device=device,
+                model_kwargs=model_kwargs,
             )
             self._dim = self._model.get_sentence_embedding_dimension()
-            logger.info(f"Model loaded: dim={self._dim}")
+            logger.info(f"Model loaded: dim={self._dim}, device={device}, dtype={dtype_name}")
 
     def embed(self, texts: List[str]) -> List[List[float]]:
         self._load()
@@ -288,6 +327,7 @@ def create_provider(config: dict) -> EmbeddingProvider:
         return LocalEmbeddingProvider(
             model_name=config.get("model", "BAAI/bge-m3"),
             cache_dir=config.get("cache_dir"),
+            device=config.get("device"),
         )
     elif mode == "fastembed":
         return FastEmbedProvider(
