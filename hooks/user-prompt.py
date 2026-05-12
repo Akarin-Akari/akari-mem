@@ -45,8 +45,19 @@ try:
     if not words:
         sys.exit(0)
 
-    # Build FTS5 OR query
-    fts_query = " OR ".join(f'"{w}"' for w in words[:5])
+    # Tokenize with jieba for CJK support
+    try:
+        from tokenizer import tokenize_query
+        fts_query = tokenize_query(" ".join(words[:5]))
+        # Wrap each jieba token as OR term for better recall
+        tokens = [t.strip() for t in fts_query.split() if t.strip()]
+        if tokens:
+            fts_query = " OR ".join(f'"{t}"' for t in tokens)
+        else:
+            fts_query = " OR ".join(f'"{w}"' for w in words[:5])
+    except ImportError:
+        # Fallback: use raw words if tokenizer unavailable
+        fts_query = " OR ".join(f'"{w}"' for w in words[:5])
 
     try:
         rows = db.execute(

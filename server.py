@@ -54,6 +54,7 @@ from mcp.server.fastmcp import FastMCP
 from store import MemoryStore
 from embeddings import create_provider
 from rerank import create_reranker
+from tokenizer import tokenize_for_fts, tokenize_query
 
 # Pre-import heavy libs at module level (before MCP stdio takes over).
 # These imports trigger grpc/protobuf/tqdm/CUDA init that writes to
@@ -165,7 +166,7 @@ def _background_warmup():
         _log(f"Warmup FAILED: {e}\n{traceback.format_exc()}")
 
 def _save_to_sqlite(title, text, tags, project, source):
-    """Fast SQLite-only save. Returns mem_id."""
+    """Fast SQLite-only save with FTS5 sync. Returns mem_id."""
     import sqlite3
     from datetime import datetime, timezone
     db_path = os.path.join(config["data_dir"], "akari-mem.db")
@@ -177,6 +178,13 @@ def _save_to_sqlite(title, text, tags, project, source):
         (title, text, tags, project, source, now, now),
     )
     mem_id = cur.lastrowid
+    # Sync FTS5 index with jieba-tokenized text
+    tok_title = tokenize_for_fts(title)
+    tok_text = tokenize_for_fts(text)
+    db.execute(
+        "INSERT INTO memories_fts(rowid, title, text, tags) VALUES (?, ?, ?, ?)",
+        (mem_id, tok_title, tok_text, tags),
+    )
     db.commit()
     db.close()
     return mem_id
@@ -283,12 +291,16 @@ async def quick_search(
 
         db = sqlite3.connect(db_path)
         db.row_factory = sqlite3.Row
+
+        # Tokenize query with jieba for CJK support
+        tokenized = tokenize_query(query)
+
         try:
-            rows = db.execute(base_sql, (query, *extra_params, limit)).fetchall()
+            rows = db.execute(base_sql, (tokenized, *extra_params, limit)).fetchall()
         except Exception:
             # FTS5 syntax error — split into OR terms
-            terms = [t.strip() for t in query.split() if t.strip()]
-            fts_q = " OR ".join(f'"{ t}"' for t in terms)
+            terms = [t.strip() for t in tokenized.split() if t.strip()]
+            fts_q = " OR ".join(f'"{t}"' for t in terms)
             try:
                 rows = db.execute(base_sql, (fts_q, *extra_params, limit)).fetchall()
             except Exception:
@@ -534,6 +546,8 @@ def main():
         run_migrate()
     if "--rebuild" in sys.argv:
         get_store().rebuild_vectors()
+    if "--rebuild-fts" in sys.argv:
+        get_store().rebuild_fts()
     if "--test" in sys.argv:
         run_test()
         return

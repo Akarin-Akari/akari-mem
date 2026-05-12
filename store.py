@@ -4,12 +4,17 @@ Dual-engine memory store: SQLite (structured) + ChromaDB (vector).
 Write operations always sync both. Read operations use the appropriate engine:
 - Semantic search → ChromaDB
 - List/filter/stats → SQLite
+
+FTS5 indexing uses jieba pre-tokenization for CJK support.
+Triggers are removed; FTS5 is managed manually in Python.
 """
 import sqlite3
 import os
 import logging
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
+
+from tokenizer import tokenize_for_fts, tokenize_query
 
 logger = logging.getLogger("akari-mem.store")
 
@@ -62,27 +67,16 @@ class MemoryStore:
                 updated_at  TEXT NOT NULL
             )
         """)
-        # FTS5 index for keyword search
+        # FTS5 index for keyword search (managed manually with jieba tokenization)
         db.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
             USING fts5(title, text, tags, content='memories', content_rowid='id')
         """)
-        # Triggers to keep FTS in sync
+        # Drop legacy auto-triggers (jieba tokenization requires Python-layer control)
         db.executescript("""
-            CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-                INSERT INTO memories_fts(rowid, title, text, tags)
-                VALUES (new.id, new.title, new.text, new.tags);
-            END;
-            CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-                INSERT INTO memories_fts(memories_fts, rowid, title, text, tags)
-                VALUES ('delete', old.id, old.title, old.text, old.tags);
-            END;
-            CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-                INSERT INTO memories_fts(memories_fts, rowid, title, text, tags)
-                VALUES ('delete', old.id, old.title, old.text, old.tags);
-                INSERT INTO memories_fts(rowid, title, text, tags)
-                VALUES (new.id, new.title, new.text, new.tags);
-            END;
+            DROP TRIGGER IF EXISTS memories_ai;
+            DROP TRIGGER IF EXISTS memories_ad;
+            DROP TRIGGER IF EXISTS memories_au;
         """)
         # Metadata table for tracking embedding model
         db.execute("""
@@ -167,6 +161,10 @@ class MemoryStore:
             (title, text, tags, project, source, now, now),
         )
         mem_id = cur.lastrowid
+
+        # Sync FTS5 index with jieba-tokenized text
+        self._fts_insert(db, mem_id, title, text, tags)
+
         db.commit()
         db.close()
 
@@ -300,6 +298,30 @@ class MemoryStore:
 
         return merged[:limit]
 
+    # ── FTS5 manual sync (jieba tokenization) ───────────────
+
+    @staticmethod
+    def _fts_insert(db: sqlite3.Connection, mem_id: int, title: str, text: str, tags: str):
+        """Insert jieba-tokenized content into FTS5 index."""
+        tok_title = tokenize_for_fts(title)
+        tok_text = tokenize_for_fts(text)
+        # tags are comma-separated ASCII-ish, no need for jieba
+        db.execute(
+            "INSERT INTO memories_fts(rowid, title, text, tags) VALUES (?, ?, ?, ?)",
+            (mem_id, tok_title, tok_text, tags),
+        )
+
+    @staticmethod
+    def _fts_delete(db: sqlite3.Connection, mem_id: int, title: str, text: str, tags: str):
+        """Remove entry from FTS5 index (content-sync requires matching values)."""
+        tok_title = tokenize_for_fts(title)
+        tok_text = tokenize_for_fts(text)
+        db.execute(
+            "INSERT INTO memories_fts(memories_fts, rowid, title, text, tags) "
+            "VALUES ('delete', ?, ?, ?, ?)",
+            (mem_id, tok_title, tok_text, tags),
+        )
+
     def _keyword_search_safe(
         self,
         query: str,
@@ -308,11 +330,14 @@ class MemoryStore:
         tags: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        FTS5 keyword search with graceful fallback.
-        FTS5 MATCH syntax can fail on certain queries — fall back silently.
+        FTS5 keyword search with jieba tokenization and graceful fallback.
+        Query is tokenized with jieba before MATCH for CJK compatibility.
         Supports optional project/tags pre-filtering.
         """
         db = self._db()
+
+        # Tokenize query with jieba for CJK support
+        tokenized_query = tokenize_query(query)
 
         # Build optional SQL WHERE clause for metadata filtering
         extra_where = ""
@@ -332,12 +357,12 @@ class MemoryStore:
         )
 
         try:
-            rows = db.execute(base_sql, (query, *extra_params, limit)).fetchall()
+            rows = db.execute(base_sql, (tokenized_query, *extra_params, limit)).fetchall()
         except Exception:
             # FTS5 syntax error — try splitting into OR terms
             try:
-                terms = [t.strip() for t in query.split() if t.strip()]
-                fts_query = " OR ".join(f'"{ t}"' for t in terms)
+                terms = [t.strip() for t in tokenized_query.split() if t.strip()]
+                fts_query = " OR ".join(f'"{t}"' for t in terms)
                 rows = db.execute(base_sql, (fts_query, *extra_params, limit)).fetchall()
             except Exception:
                 rows = []
@@ -412,25 +437,39 @@ class MemoryStore:
         return dict(row) if row else None
 
     def delete(self, memory_id: int) -> bool:
-        """Delete from both SQLite and ChromaDB (including all chunks)."""
+        """Delete from SQLite, FTS5, and ChromaDB (including all chunks)."""
         db = self._db()
-        cur = db.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+
+        # Read original data first (needed for FTS5 content-sync delete)
+        row = db.execute(
+            "SELECT title, text, tags FROM memories WHERE id=?", (memory_id,)
+        ).fetchone()
+        if not row:
+            db.close()
+            return False
+
+        # Delete from FTS5 first (requires original values for content-sync)
+        try:
+            self._fts_delete(db, memory_id, row["title"], row["text"], row["tags"])
+        except Exception as e:
+            logger.warning(f"FTS5 delete for #{memory_id} failed (non-fatal): {e}")
+
+        # Delete from SQLite
+        db.execute("DELETE FROM memories WHERE id=?", (memory_id,))
         db.commit()
         db.close()
 
-        if cur.rowcount > 0:
+        # Delete from ChromaDB
+        try:
+            self._collection.delete(where={"sqlite_id": memory_id})
+        except Exception:
             try:
-                # Delete all chunks for this memory using metadata filter
-                self._collection.delete(where={"sqlite_id": memory_id})
+                self._collection.delete(ids=[f"mem_{memory_id}"])
             except Exception:
-                # Fallback: try legacy single-id delete
-                try:
-                    self._collection.delete(ids=[f"mem_{memory_id}"])
-                except Exception:
-                    pass
-            logger.info(f"Deleted memory #{memory_id} (including chunks)")
-            return True
-        return False
+                pass
+
+        logger.info(f"Deleted memory #{memory_id} (including chunks)")
+        return True
 
     def get_stats(self) -> Dict[str, Any]:
         """Get memory store statistics."""
@@ -455,6 +494,23 @@ class MemoryStore:
             "latest_memory": latest[0] if latest else None,
             "data_dir": self.data_dir,
         }
+
+    def rebuild_fts(self):
+        """Rebuild FTS5 index with jieba tokenization. Use after first installing jieba."""
+        logger.info("Rebuilding FTS5 index with jieba tokenization...")
+        db = self._db()
+
+        # Purge existing FTS5 index
+        db.execute("INSERT INTO memories_fts(memories_fts) VALUES ('delete-all')")
+
+        # Re-index all memories with jieba tokenization
+        rows = db.execute("SELECT id, title, text, tags FROM memories ORDER BY id").fetchall()
+        for r in rows:
+            self._fts_insert(db, r["id"], r["title"], r["text"], r["tags"])
+
+        db.commit()
+        db.close()
+        logger.info(f"FTS5 rebuild complete: {len(rows)} memories re-indexed with jieba")
 
     def rebuild_vectors(self):
         """Re-embed all memories in ChromaDB with chunking. Use after changing embedding model."""

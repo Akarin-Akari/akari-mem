@@ -22,6 +22,7 @@ Endpoints:
 import os, sys, json, sqlite3, logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+from tokenizer import tokenize_query
 
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _PROJECT_ROOT not in sys.path:
@@ -73,14 +74,16 @@ def _list_recent(limit=10):
     return [dict(r) for r in rows]
 
 def _quick_search(query, limit=5):
+    # Tokenize query with jieba for CJK support
+    tokenized = tokenize_query(query)
     db = _db()
     try:
         rows = db.execute(
             "SELECT m.* FROM memories m JOIN memories_fts f ON m.id = f.rowid "
-            "WHERE memories_fts MATCH ? ORDER BY rank LIMIT ?", (query, limit)
+            "WHERE memories_fts MATCH ? ORDER BY rank LIMIT ?", (tokenized, limit)
         ).fetchall()
     except Exception:
-        terms = [t.strip() for t in query.split() if t.strip()]
+        terms = [t.strip() for t in tokenized.split() if t.strip()]
         fts_q = " OR ".join(f'"{t}"' for t in terms)
         try:
             rows = db.execute(
