@@ -9,17 +9,26 @@
         "pooling": "cls",
         "prefer_trt": false,
         "trt_workspace_mb": 1024,
-        "gpu_mem_limit_gb": 3.0
+        "gpu_mem_limit_gb": 4.0
     },
     "rerank": {
-        "mode": "fastembed",
+        "mode": "onnx",
         "model": "jinaai/jina-reranker-v2-base-multilingual",
-        "device": "cpu"
+        "device": "cuda",
+        "max_length": 256,
+        "gpu_mem_limit_gb": 3.0
     },
     "idle_unload": {
         "enabled": true,
         "timeout_seconds": 600,
         "targets": ["reranker", "embedding"]
+    },
+    "daemon": {
+        "host": "127.0.0.1",
+        "port": 37800,
+        "spawn_timeout_seconds": 60,
+        "request_timeout_seconds": 300,
+        "idle_shutdown_seconds": 1800
     },
     "log_level": "INFO"
 }

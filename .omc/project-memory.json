@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1774455253287,
+  "lastScanned": 1778605332926,
   "projectRoot": "F:\\claude-tools\\akari-mem-mcp",
   "techStack": {
     "languages": [
@@ -33,44 +33,145 @@
   "structure": {
     "isMonorepo": false,
     "workspaces": [],
-    "mainDirectories": [],
-    "gitBranches": null
+    "mainDirectories": [
+      "docs",
+      "scripts",
+      "static",
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "master",
+      "branchingStrategy": null
+    }
   },
   "customNotes": [],
   "directoryMap": {
     "data": {
       "path": "data",
       "purpose": "Data files",
-      "fileCount": 1,
-      "lastAccessed": 1774455253125,
+      "fileCount": 2,
+      "lastAccessed": 1778605332846,
       "keyFiles": [
-        "akari-mem.db"
+        "akari-mem.db",
+        "warmup.log"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 6,
+      "lastAccessed": 1778605332847,
+      "keyFiles": [
+        "2026-05-12 BGE-M3 ONNX FP16 量化实施报告.md",
+        "2026-05-12 FTS5中文搜索修复完成报告.md",
+        "Akari-Mem-MCP 架构优化实施计划 implementation_plan.md",
+        "optimization_proposals.md",
+        "Phase 3 调研报告：FastEmbed 兼容性评估fastembed_research.md"
       ]
     },
     "hooks": {
       "path": "hooks",
       "purpose": null,
       "fileCount": 2,
-      "lastAccessed": 1774455253128,
+      "lastAccessed": 1778605332847,
       "keyFiles": [
         "session-start.py",
         "user-prompt.py"
       ]
     },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 6,
+      "lastAccessed": 1778605332848,
+      "keyFiles": [
+        "convert_bge_m3_fp16.py",
+        "download_bge_m3_onnx.py",
+        "smoke_test_onnx.py",
+        "verify_onnx_fp16.py",
+        "vram_onnx_only.py"
+      ]
+    },
+    "static": {
+      "path": "static",
+      "purpose": "Static files",
+      "fileCount": 0,
+      "lastAccessed": 1778605332849,
+      "keyFiles": []
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 2,
+      "lastAccessed": 1778605332849,
+      "keyFiles": [
+        "test_phase1_2.py",
+        "test_phase3.py"
+      ]
+    },
     "__pycache__": {
       "path": "__pycache__",
       "purpose": null,
-      "fileCount": 9,
-      "lastAccessed": 1774455253130,
+      "fileCount": 14,
+      "lastAccessed": 1778605332850,
       "keyFiles": [
         "api_server.cpython-314.pyc",
+        "chunker.cpython-310.pyc",
         "embeddings.cpython-310.pyc",
         "embeddings.cpython-314.pyc",
-        "env_loader.cpython-314.pyc",
-        "migrate.cpython-314.pyc"
+        "env_loader.cpython-310.pyc"
       ]
     }
   },
-  "hotPaths": [],
+  "hotPaths": [
+    {
+      "path": "embeddings.py",
+      "accessCount": 15,
+      "lastAccessed": 1778615030303,
+      "type": "directory"
+    },
+    {
+      "path": "server.py",
+      "accessCount": 15,
+      "lastAccessed": 1778615057176,
+      "type": "directory"
+    },
+    {
+      "path": "rerank.py",
+      "accessCount": 9,
+      "lastAccessed": 1778658567573,
+      "type": "directory"
+    },
+    {
+      "path": "store.py",
+      "accessCount": 8,
+      "lastAccessed": 1778615178855,
+      "type": "directory"
+    },
+    {
+      "path": "CLAUDE.md",
+      "accessCount": 5,
+      "lastAccessed": 1778615260217,
+      "type": "file"
+    },
+    {
+      "path": "config.json",
+      "accessCount": 5,
+      "lastAccessed": 1778658675597,
+      "type": "file"
+    },
+    {
+      "path": "",
+      "accessCount": 1,
+      "lastAccessed": 1778610214523,
+      "type": "directory"
+    },
+    {
+      "path": "5.13.txt",
+      "accessCount": 1,
+      "lastAccessed": 1778614997386,
+      "type": "file"
+    }
+  ],
   "userDirectives": []
 }

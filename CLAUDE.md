@@ -28,6 +28,71 @@
 - cuDNN 必须是 **9.x**
 - 这套组合恰好被 PyTorch 2.11+cu128 完全覆盖，**所以 venv 自带就够了，不需要任何系统级安装**。
 
+## 🔴 Thin Client + Daemon 架构（2026-05-13 后，解决多 Agent 显存爆炸）
+
+**问题背景：** MCP stdio 协议每个 Claude Code agent 启动一个独立子进程，原 `server.py` 每个实例都加载完整 BGE-M3 + jina-reranker（~3.5GB VRAM），3+ agent 同时跑会爆 5070 的 12GB 显存。
+
+**架构方案：**
+```
+Agent 1 → server.py (thin client) ─┐
+Agent 2 → server.py (thin client) ─┼─→ HTTP 127.0.0.1:37800 → api_server.py (daemon 单例)
+Agent 3 → server.py (thin client) ─┘                                  ↓
+                                                          BGE-M3 + jina-reranker
+                                                          （全局只加载一次！VRAM 共享）
+```
+
+**三个核心文件：**
+| 文件 | 角色 | 说明 |
+|------|------|------|
+| `api_server.py` | **Daemon 主进程** | 唯一加载模型, 提供 HTTP API, Windows DETACHED_PROCESS 静默后台运行 |
+| `daemon_client.py` | **Thin Client HTTP 库** | 封装 daemon spawn + HTTP 调用, urllib stdlib 实现 |
+| `server.py` | **MCP Thin Client** | 每个 Claude Code agent 一个, 不加载模型, 全部 tool 转发给 daemon |
+
+**单例机制：** 用 socket bind 抢占法（不用 file lock）。多个 thin client 同时尝试 spawn 也安全——第一个 bind 到 port 37800 的 daemon 存活，其他 spawn 进程检测到端口占用立即 `sys.exit(0)`（见 `api_server.py:main`）。
+
+**Daemon 启动方式（关键！）：** 必须用 **`pythonw.exe`**（GUI 子系统，无控制台窗口），不是 `python.exe`。即使配合 `DETACHED_PROCESS | CREATE_NO_WINDOW`，`python.exe`（控制台子系统）仍可能留下一个空白终端窗口。`daemon_client._get_daemon_python_exe()` 自动从 venv 找 `pythonw.exe`。
+
+**绝对禁止：**
+- ❌ 不要在 `server.py` 里恢复模型加载逻辑（它必须是 thin client）
+- ❌ 不要用 `sys.executable`（python.exe）spawn daemon——会有空白窗口
+- ❌ 不要在 daemon spawn 时省掉 `STARTUPINFO.SW_HIDE`——四重保险一个都不能少
+- ❌ 不要把 daemon 改成监听 0.0.0.0——必须绑 127.0.0.1（本地单机用）
+
+**Daemon 生命周期：**
+- 启动：thin client 首次启动时按需 spawn（auto_spawn=true）
+- 模型加载：daemon 后台 warmup 线程异步加载（与 HTTP 服务并行）
+- 闲置卸载：5 分钟无 search/save → 卸载模型释放 VRAM（`idle_unload.timeout_seconds=600`）
+- 自我退出：30 分钟无任何 HTTP 请求 → daemon 进程自我退出（`daemon.idle_shutdown_seconds=1800`）
+- 用户手动停：`POST http://127.0.0.1:37800/shutdown`
+
+**新增/扩展的 HTTP endpoint：**
+| Endpoint | 方法 | 说明 |
+|----------|------|------|
+| `/health` | GET | 含 warmup 状态 + models_loaded |
+| `/search` | GET | 新增 `project` `tags` filter |
+| `/deep` | GET | 新增 `project` `tags` filter，深度搜索串行化 |
+| `/memory?id=N` | GET | **新增** 拿单条完整内容 |
+| `/save` | POST | 改为 SQLite 即时 + ChromaDB 异步排队（不阻塞） |
+| `/delete?id=N` | DELETE | 同步删 SQLite + ChromaDB |
+| `/shutdown` | POST | **新增** 优雅停机 |
+
+**配置（config.json 的 `daemon` section）：**
+```json
+"daemon": {
+    "host": "127.0.0.1",
+    "port": 37800,
+    "spawn_timeout_seconds": 60,
+    "request_timeout_seconds": 300,
+    "idle_shutdown_seconds": 1800
+}
+```
+
+**调试时定位 daemon：**
+- `data/daemon.pid` — 当前 daemon 的 PID + 端口 + 启动时间戳
+- `data/daemon-stderr.log` — daemon 的 stderr（含 ORT 原生输出）
+- `data/daemon-stdout.log` — daemon 的 stdout
+- `data/warmup.log` — 模型加载子步骤 trace（thin client + daemon 共用同一个文件）
+
 ## 🔴 server.py 头部的 ctypes DLL 预加载（关键启动逻辑，不要乱改）
 
 `server.py` 在 `import onnxruntime` 之前，用 `ctypes.WinDLL()` **主动按依赖顺序预加载** `torch/lib/` 下的 20 个 CUDA/cuDNN DLL。
@@ -44,17 +109,25 @@
 | 组件 | 后端 | 设备 |
 |------|------|------|
 | Embedding（BGE-M3） | **ONNX**（自导出 FP16） | **GPU**（CUDA EP） |
-| Reranker（jina-reranker-v2） | **fastembed** | **CPU** |
+| Reranker（jina-reranker-v2） | **自定义 ONNX**（绕过 fastembed 拿回 SessionOptions 控制权） | **GPU**（CUDA EP，gpu_mem_limit=1GB tight arena） |
 | FTS5 中文分词 | **jieba** 预分词 | CPU |
 | 向量存储 | **ChromaDB**（PersistentClient） | 本地磁盘 |
 | 元数据 | **SQLite** | 本地磁盘 |
 
+**架构变更说明（2026-05-13）：**
+- 主人解除了「reranker 必须跑 CPU」的旧规则，要求最低显存 + < 10s RAG 召回
+- 改动详情：
+  - `rerank.py` 新增 `OnnxReranker` 类，直接用 onnxruntime 加载 fastembed 缓存里的 ONNX，套用跟 BGE-M3 完全相同的 tight CUDA arena 配置（`arena_extend_strategy=kSameAsRequested` + `cudnn_conv_use_max_workspace=0` + `cudnn_conv_algo_search=HEURISTIC` + `gpu_mem_limit`）
+  - `config.json`：`rerank.mode=onnx` / `device=cuda` / `gpu_mem_limit_gb=1.0` / `max_length=256`
+  - `store.py` `fetch_k` 从 `limit*3` 收紧到 `max(limit*2, 10)`，rerank 输入候选 -33%
+  - 不再走 `FastEmbedReranker`（它不暴露 SessionOptions，VRAM 不可控）
+
 **禁止改动：**
-- ❌ 不要把 reranker 改成 GPU
 - ❌ 不要把 embedding 改回 sentence-transformers / fastembed-GPU
 - ❌ 不要换掉 ONNX 后端（如改回 sentence-transformers）
+- ❌ 不要把 reranker 改回 FastEmbedReranker 跑 GPU——它的 VRAM 不可控
 - ❌ 不要在 embedding/rerank 里加内部锁（之前导致死锁）
-- ❌ 不要让 search_memory 被并行调用（之前导致显存爆炸）
+- ❌ 不要让 search_memory 被并行调用（之前导致显存爆炸；server.py 的 `_get_deep_search_sem` 已用 asyncio 信号量串行化）
 
 ## 🔴 ONNX SessionOptions 关键参数
 
@@ -97,32 +170,59 @@ self._tokenizer.enable_truncation(max_length=512)
 
 | 文件 | 用途 |
 |------|------|
-| `server.py` | MCP 入口，包含 CUDA 预加载 + fd 2 重定向 + HF 离线模式 |
+| `api_server.py` | **Daemon 主进程**：CUDA 预加载 + fd 2 重定向 + 模型加载 + HTTP API + 单例机制 |
+| `daemon_client.py` | **Thin client HTTP 库**：pythonw.exe spawn + urllib 调用 + 失败 retry |
+| `server.py` | **MCP thin client**：fd 2 重定向 + HF 离线模式 + 所有 tool 走 daemon_client |
 | `embeddings.py` | OnnxEmbeddingProvider（ORT + tokenizers.from_file） |
-| `rerank.py` | FastEmbedReranker（CPU 模式） |
+| `rerank.py` | `OnnxReranker`（CUDA EP + tight arena）+ `FastEmbedReranker`（legacy fallback） |
 | `store.py` | MemoryStore（SQLite + ChromaDB） |
 | `tokenizer.py` | FTS5 jieba 中文分词（独立路径，不受 BGE-M3 影响） |
+| `data/daemon.pid` | Daemon 当前 PID + 端口 + 启动时间戳（pythonw.exe 进程） |
+| `data/daemon-stderr.log` | Daemon stderr（ORT 原生输出） |
+| `data/daemon-stdout.log` | Daemon stdout |
 | `data/warmup.log` | 启动 sub-step trace（独立于 stderr） |
-| `data/stderr.log` | 重定向后的 OS 级 stderr（ORT 原生输出） |
+| `data/stderr.log` | Thin client stderr（应该几乎是空的） |
 | `F:/models/bge-m3-onnx-fp16/onnx/` | 自导出 BGE-M3 FP16 ONNX + tokenizer.json |
 | `F:/models/bge-m3-onnx-fp16/load_stderr.log` | InferenceSession 创建时的 ORT 错误日志 |
+| `F:/models/fastembed/models--jinaai--jina-reranker-v2-base-multilingual/snapshots/*/onnx/` | jina-reranker ONNX（fastembed 下载，OnnxReranker 直读） |
+| `api_server.py.backup.before_daemon_upgrade` | 升级前的单体 api_server.py 备份 |
+| `server.py.backup.before_thin_client` | 升级前的单体 server.py 备份（含 893 行模型加载逻辑） |
 
 ## 调试速查
 
 | 症状 | 真因 | 修复 |
 |------|------|------|
-| RAM 爆 + VRAM 不动 + 召回 50s+ | CUDA EP silent fallback CPU | 检查 server.py 头部 ctypes 预加载是否完整 |
+| 启动 thin client 时弹出空白终端窗口 | daemon_client 用了 python.exe 而不是 pythonw.exe | 检查 `_get_daemon_python_exe()` 是否在 venv 找到 `pythonw.exe` |
+| 多个 agent 都在加载模型 | thin client 仍在加载模型（没走 daemon） | 检查 server.py 是否真的是 thin client 版本（应该 < 400 行） |
+| daemon 起不来 | 端口 37800 被占 / pythonw.exe 缺失 / 模型路径错 | 看 `data/daemon-stderr.log` |
+| thin client 报 `[daemon error]` | daemon 不可达 / spawn 失败 / HTTP 超时 | 看 `data/daemon-stderr.log` + 确认 `data/daemon.pid` 存在 |
+| 第一次 deep search 慢 (8-15s) | daemon warmup 仍在加载模型 | 等 warmup ready (看 `/health` 的 `warmup` 字段) |
+| daemon 突然消失 | idle_shutdown_seconds=1800 超时 | 下次 thin client 调用会自动 re-spawn，无需手动干预 |
+| RAM 爆 + VRAM 不动 + 召回 50s+ | CUDA EP silent fallback CPU | 检查 api_server.py 头部 ctypes 预加载是否完整 |
 | `Error 126: cublasLt64_12.dll missing` | torch/lib 未预加载到进程 | 同上 |
 | `SimplifiedLayerNormFusion` crash | ORT 1.23 bug | 确认 graph_optimization_level=ORT_ENABLE_EXTENDED |
 | Step 3 卡 5-30 分钟 | AutoTokenizer 在 MCP 下阻塞 | 确认用了 tokenizers.Tokenizer.from_file |
-| Warmup 完全无响应 | fd 2 阻塞 MCP 管道 | 确认 server.py 头部 os.dup2 重定向在位 |
+| Warmup 完全无响应 | fd 2 阻塞 MCP 管道 | 确认 api_server.py 头部 os.dup2 重定向在位 |
 
-## 性能基准（修复全部 patch 后预期）
+## 性能基准（thin client + daemon 架构下预期）
 
 | 指标 | 目标 |
 |------|------|
-| 首次冷启动到模型 ready | < 5 秒 |
-| 首次 search_memory | 10-15 秒（含 reranker 冷启动 + CUDA kernel JIT） |
-| 后续 search_memory | 1-3 秒 |
-| VRAM 占用 | 1.5-2 GB（embedding GPU）+ 0 GB（reranker CPU） |
-| RAM 占用 | < 2 GB |
+| Thin client 启动（daemon 已在跑） | < 200ms（仅 import mcp 库 + health check） |
+| Thin client 首次启动（需 spawn daemon） | 5-15 秒（含 daemon 进程启动 + 异步 warmup） |
+| Daemon 首次冷启动到模型 ready | < 5 秒 |
+| 首次 search_memory（warmup 已完成） | 5-10 秒（含 reranker 冷启动 + CUDA kernel JIT，比之前 28s+ 快 3-5x） |
+| 后续 search_memory | 0.5-1.5 秒（embedding GPU + reranker GPU，目标 < 10s 已远超） |
+| VRAM 占用（**所有 thin client 共享**） | ~2.5 GB（仅 BGE-M3 加载，reranker idle-unload 后释放） |
+| VRAM 占用（search 中） | ~3.5 GB（BGE-M3 ~2.5GB + jina-reranker tight arena ~1GB） |
+| RAM 占用（daemon） | < 2 GB |
+| RAM 占用（每个 thin client） | < 50 MB（只 import mcp + urllib） |
+
+**多 agent 场景对比（5070 12GB 显存）：**
+
+| Agent 数 | 旧架构（独立模型）| 新架构（共享 daemon） |
+|---------|--------------|------------------|
+| 1 | 3.5 GB VRAM | 3.5 GB VRAM |
+| 3 | ~10.5 GB（接近爆显存） | **3.5 GB**（不变！） |
+| 5 | 💥 17.5 GB（必爆） | **3.5 GB**（不变！） |
+| 10 | 💥💥 完全无法运行 | **3.5 GB**（依然不变！） |

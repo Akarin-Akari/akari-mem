@@ -238,9 +238,12 @@ class MemoryStore:
 
         Returns list of memory dicts sorted by relevance.
         """
-        # Determine how many candidates to fetch
-        fetch_k = limit * 3 if self._reranker else limit * 2
-        fetch_k = max(fetch_k, 10)  # at least 10 candidates for good fusion
+        # Determine how many candidates to fetch.
+        # L3: keep candidate pool tight (top-10 ceiling). The previous formula
+        # limit*3 over-fetched 15-30 docs for a typical limit=5/10 query, and
+        # the cross-encoder forward pass scales linearly with this count.
+        # With limit=5 → fetch_k=10 (vs 15 before): ~33% less rerank work.
+        fetch_k = max(limit * 2, 10)
 
         # Build ChromaDB where filter for metadata pre-filtering
         chroma_where = None

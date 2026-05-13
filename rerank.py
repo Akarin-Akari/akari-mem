@@ -4,11 +4,12 @@ Rerank module for akari-mem-mcp.
 Two-stage retrieval: first retrieve candidates via embedding search,
 then re-score with a cross-encoder reranker for higher precision.
 
-Supports 4 modes:
+Supports 5 modes:
 1. LOCAL     — cross-encoder via sentence-transformers (PyTorch)
-2. FASTEMBED — cross-encoder via FastEmbed ONNX (lightweight)
-3. API       — Jina/Cohere rerank API
-4. NONE      — disabled (default), pass-through
+2. FASTEMBED — cross-encoder via FastEmbed ONNX (lightweight, no VRAM control)
+3. ONNX      — custom onnxruntime cross-encoder with tight CUDA arena (preferred GPU path)
+4. API       — Jina/Cohere rerank API
+5. NONE      — disabled (default), pass-through
 """
 import os
 import json
@@ -290,6 +291,252 @@ class FastEmbedReranker(Reranker):
         gc.collect()
 
 
+class OnnxReranker(Reranker):
+    """
+    Custom ONNX cross-encoder reranker bypassing fastembed's TextCrossEncoder.
+
+    Why this exists:
+    - fastembed.TextCrossEncoder does NOT expose ORT SessionOptions or
+      provider_options. That means we cannot cap the CUDA arena or disable
+      the cuDNN max-workspace probing. On GPU that lets VRAM creep to
+      several GB per inference batch.
+    - This class loads the SAME ONNX file fastembed already downloaded into
+      its cache (default F:/models/fastembed/...) but builds the ORT session
+      with the exact tight-arena config used by OnnxEmbeddingProvider:
+        arena_extend_strategy=kSameAsRequested,
+        cudnn_conv_use_max_workspace=0,
+        cudnn_conv_algo_search=HEURISTIC,
+        gpu_mem_limit cap (default 1 GB — jina-reranker-v2-base FP32 ~1.1GB
+        weights + ~0.4GB activations comfortably fits under 1.5GB after the
+        arena cap; if VRAM still spikes raise to 1.5 in config.json).
+    - Uses tokenizers.Tokenizer.from_file (Rust) instead of transformers
+      AutoTokenizer for the same MCP-stdio-blocking reason as BGE-M3.
+    - Truncates pairs to max_length=256 by default (vs FastEmbed's 512) for
+      ~2x rerank throughput at negligible quality loss for short snippets.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "jinaai/jina-reranker-v2-base-multilingual",
+        cache_dir: Optional[str] = None,
+        device: str = "cuda",
+        max_length: int = 256,
+        gpu_mem_limit_gb: float = 1.0,
+    ):
+        self._model_name = model_name
+        self._cache_dir = cache_dir or os.environ.get(
+            "AKARI_MODEL_CACHE", "F:/models/fastembed"
+        )
+        self._device = (device or "cuda").lower()
+        self._max_length = int(max_length)
+        self._gpu_mem_limit_bytes = int(gpu_mem_limit_gb * 1024 * 1024 * 1024)
+        self._session = None
+        self._tokenizer = None
+        self._output_name: Optional[str] = None
+        self._needs_token_type_ids: bool = False
+
+    def _find_artifacts(self):
+        """Locate ONNX + tokenizer in fastembed's HuggingFace-style cache.
+
+        Layout:
+            <cache>/models--{org}--{name}/snapshots/<hash>/onnx/model.onnx
+            <cache>/models--{org}--{name}/snapshots/<hash>/onnx/model_fp16.onnx  (optional)
+            <cache>/models--{org}--{name}/snapshots/<hash>/tokenizer.json
+
+        Precedence: model_fp16.onnx > model.onnx
+        (FP16 cuts weights from ~1.1 GB → 531 MB, ~50% VRAM savings.)
+        """
+        repo_dir = "models--" + self._model_name.replace("/", "--")
+        snap_root = os.path.join(self._cache_dir, repo_dir, "snapshots")
+        if not os.path.isdir(snap_root):
+            raise FileNotFoundError(
+                f"Reranker cache not found: {snap_root}. "
+                f"Run once with mode=fastembed to populate the cache, "
+                f"or set rerank.cache_dir in config.json."
+            )
+        snaps = [
+            d for d in os.listdir(snap_root)
+            if os.path.isdir(os.path.join(snap_root, d))
+        ]
+        if not snaps:
+            raise FileNotFoundError(f"No snapshots under {snap_root}")
+        snap_dir = os.path.join(snap_root, snaps[0])
+        onnx_dir = os.path.join(snap_dir, "onnx")
+        # Prefer FP16 if present (half VRAM, half I/O).
+        fp16_file = os.path.join(onnx_dir, "model_fp16.onnx")
+        fp32_file = os.path.join(onnx_dir, "model.onnx")
+        if os.path.exists(fp16_file):
+            onnx_file = fp16_file
+        elif os.path.exists(fp32_file):
+            onnx_file = fp32_file
+        else:
+            raise FileNotFoundError(
+                f"Neither model_fp16.onnx nor model.onnx found in {onnx_dir}"
+            )
+        tok_file = os.path.join(snap_dir, "tokenizer.json")
+        if not os.path.exists(tok_file):
+            raise FileNotFoundError(f"tokenizer.json not found: {tok_file}")
+        return onnx_file, tok_file
+
+    def _load(self):
+        if self._session is not None:
+            return
+
+        def _tr(msg: str) -> None:
+            try:
+                import time as _t
+                _p = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "data", "warmup.log",
+                )
+                with open(_p, "a", encoding="utf-8") as _f:
+                    _f.write(f"[{_t.strftime('%H:%M:%S')}] [onnx-rerank-load] {msg}\n")
+                    _f.flush()
+            except Exception:
+                pass
+
+        _tr(f"start (model={self._model_name}, device={self._device})")
+
+        import onnxruntime as ort
+        ort.set_default_logger_severity(3)
+
+        onnx_file, tok_file = self._find_artifacts()
+        _tr(f"artifacts onnx={onnx_file}")
+
+        from tokenizers import Tokenizer as _FastTok
+        self._tokenizer = _FastTok.from_file(tok_file)
+        # XLM-RoBERTa family (jina-reranker-v2 inherits): pad_id=1 (<pad>).
+        self._tokenizer.enable_padding(pad_id=1, pad_token="<pad>")
+        self._tokenizer.enable_truncation(max_length=self._max_length)
+        _tr("tokenizer ready")
+
+        # Tight CUDA arena (matches OnnxEmbeddingProvider).
+        providers = []
+        if self._device == "cuda":
+            providers.append((
+                "CUDAExecutionProvider",
+                {
+                    "device_id": 0,
+                    "arena_extend_strategy": "kSameAsRequested",
+                    "cudnn_conv_algo_search": "HEURISTIC",
+                    "cudnn_conv_use_max_workspace": "0",
+                    "do_copy_in_default_stream": True,
+                    "gpu_mem_limit": str(self._gpu_mem_limit_bytes),
+                },
+            ))
+        providers.append("CPUExecutionProvider")
+
+        sess_options = ort.SessionOptions()
+        # Same EXTENDED workaround as BGE-M3 (ORT 1.23 ENABLE_ALL fusion bug).
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+        sess_options.enable_mem_pattern = False
+        sess_options.enable_cpu_mem_arena = False
+        sess_options.log_severity_level = 3
+
+        # Redirect fd 2 during session build (MCP stdio pipe safety).
+        _stderr_log = os.path.join(os.path.dirname(onnx_file), "load_stderr.log")
+        _saved_fd2 = None
+        try:
+            try:
+                _saved_fd2 = os.dup(2)
+                _redir_fd = os.open(_stderr_log, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+                os.dup2(_redir_fd, 2)
+                os.close(_redir_fd)
+            except Exception:
+                _saved_fd2 = None
+            _tr("InferenceSession start")
+            self._session = ort.InferenceSession(
+                onnx_file, sess_options=sess_options, providers=providers
+            )
+            _tr("InferenceSession done")
+        finally:
+            if _saved_fd2 is not None:
+                try:
+                    os.dup2(_saved_fd2, 2)
+                    os.close(_saved_fd2)
+                except Exception:
+                    pass
+
+        input_names = {i.name for i in self._session.get_inputs()}
+        self._needs_token_type_ids = "token_type_ids" in input_names
+
+        outputs = self._session.get_outputs()
+        self._output_name = outputs[0].name
+
+        actual = self._session.get_providers()
+        logger.info(
+            f"OnnxReranker ready: model={self._model_name}, "
+            f"providers={actual}, output='{self._output_name}', "
+            f"token_type_ids={self._needs_token_type_ids}, "
+            f"max_length={self._max_length}"
+        )
+
+        import gc as _gc
+        _gc.collect()
+
+    def rerank(
+        self, query: str, documents: List[Dict[str, Any]], top_k: int = 5
+    ) -> List[Dict[str, Any]]:
+        import numpy as np
+        self._load()
+
+        if not documents:
+            return []
+
+        # Build (query, passage) pairs — tokenizers handles the special-token
+        # insertion (XLM-R: <s> q </s></s> p </s>) for pair input.
+        passages = [f"{doc['title']}\n{doc['text']}" for doc in documents]
+        pairs = [(query, p) for p in passages]
+
+        encs = self._tokenizer.encode_batch(pairs)
+        input_ids = np.array([e.ids for e in encs], dtype=np.int64)
+        attention_mask = np.array([e.attention_mask for e in encs], dtype=np.int64)
+        feed = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        if self._needs_token_type_ids:
+            feed["token_type_ids"] = np.zeros_like(input_ids, dtype=np.int64)
+
+        outputs = self._session.run([self._output_name], feed)
+        logits = outputs[0]
+
+        # Cross-encoder convention: scalar logit per pair (shape [B, 1]) is
+        # the relevance score. Some 2-class heads output [neg, pos]; take
+        # the last column ("pos") in that case.
+        if logits.ndim == 2:
+            if logits.shape[1] == 1:
+                scores = logits[:, 0]
+            else:
+                scores = logits[:, -1]
+        else:
+            scores = logits.ravel()
+
+        for i, doc in enumerate(documents):
+            doc["rerank_score"] = float(scores[i])
+
+        reranked = sorted(documents, key=lambda d: d["rerank_score"], reverse=True)
+        return reranked[:top_k]
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    # ── Idle-unload API (swap-style; see embeddings.py for rationale) ──
+    def is_loaded(self) -> bool:
+        return self._session is not None
+
+    def unload(self) -> None:
+        import gc
+        if self._session is None:
+            return
+        logger.info(f"Unloading OnnxReranker ({self._model_name})...")
+        self._session = None
+        self._tokenizer = None
+        self._output_name = None
+        gc.collect()
+
+
 class NoReranker(Reranker):
     """Pass-through: no reranking, return as-is."""
 
@@ -327,6 +574,14 @@ def create_reranker(config: dict) -> Reranker:
             model_name=config.get("model", "jinaai/jina-reranker-v2-base-multilingual"),
             cache_dir=config.get("cache_dir"),
             device=config.get("device", "cpu"),
+        )
+    elif mode == "onnx":
+        return OnnxReranker(
+            model_name=config.get("model", "jinaai/jina-reranker-v2-base-multilingual"),
+            cache_dir=config.get("cache_dir"),
+            device=config.get("device", "cuda"),
+            max_length=int(config.get("max_length", 256)),
+            gpu_mem_limit_gb=float(config.get("gpu_mem_limit_gb", 1.0)),
         )
     elif mode == "api":
         return APIReranker(
