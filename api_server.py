@@ -377,6 +377,26 @@ def _background_warmup():
         _warmup_log("Step 2: create_reranker...")
         r = create_reranker(config.get("rerank", {}))
         _warmup_log(f"Step 2 done: {type(r).__name__}")
+        # Step 2.5 — eager-load reranker ONNX session so the first /deep call
+        # does NOT pay the ~3s lazy-init penalty. NoReranker/APIReranker have
+        # no _load method and silently skip; LocalReranker/FastEmbedReranker/
+        # OnnxReranker all expose _load() and will fully materialize here.
+        # Failure is non-fatal — store can still serve via lazy init on first call.
+        try:
+            _eager_load_fn = getattr(r, "_load", None)
+            if callable(_eager_load_fn):
+                _warmup_log("Step 2.5: eager-load reranker ONNX session...")
+                _eager_load_fn()
+                _warmup_log("Step 2.5 done: reranker ONNX session loaded")
+            else:
+                _warmup_log(
+                    f"Step 2.5 SKIP: {type(r).__name__} has no _load() — "
+                    f"nothing to eager-load"
+                )
+        except Exception as _eager_err:
+            _warmup_log(
+                f"Step 2.5 FAILED (continuing with lazy init fallback): {_eager_err}"
+            )
         _warmup_log("Step 3: MemoryStore init...")
         _store_obj = _MS(data_dir=DATA_DIR, embedding_provider=p, reranker=r)
         _warmup_log("Step 3 done")
@@ -539,7 +559,13 @@ def _delete_full(memory_id):
 
 def _get_stats():
     if not os.path.exists(DB_PATH):
-        return {"total": 0, "warmup": _warmup_state, "models_loaded": False}
+        return {
+            "total": 0,
+            "warmup": _warmup_state,
+            "models_loaded": False,
+            "embedding_loaded": False,
+            "reranker_loaded": False,
+        }
     db = _db()
     total = db.execute("SELECT COUNT(*) as cnt FROM memories").fetchone()["cnt"]
     latest = db.execute("SELECT title FROM memories ORDER BY id DESC LIMIT 1").fetchone()
@@ -549,12 +575,42 @@ def _get_stats():
     ):
         projects[row["project"]] = row["cnt"]
     db.close()
+
+    # Per-model load state — checks whether the ONNX InferenceSession is
+    # actually materialized in memory, not just whether the Python wrapper
+    # object exists. The old `models_loaded` field only checked _store is not
+    # None, which lies during the window between warmup-Step-2 (wrapper built)
+    # and the first rerank() call (when the session is lazily created).
+    embedding_loaded = False
+    reranker_loaded = False
+    if _store is not None:
+        try:
+            _p = getattr(_store, "_provider", None)
+            embedding_loaded = bool(
+                _p is not None
+                and hasattr(_p, "is_loaded")
+                and _p.is_loaded()
+            )
+        except Exception:
+            pass
+        try:
+            _r = getattr(_store, "_reranker", None)
+            reranker_loaded = bool(
+                _r is not None
+                and hasattr(_r, "is_loaded")
+                and _r.is_loaded()
+            )
+        except Exception:
+            pass
+
     return {
         "total": total,
         "latest": latest["title"] if latest else None,
         "embedding": config.get("embedding", {}).get("model", "default"),
         "rerank": config.get("rerank", {}).get("model", "none"),
-        "models_loaded": _store is not None,
+        "models_loaded": _store is not None,  # 向后兼容：旧含义=store 已构建
+        "embedding_loaded": embedding_loaded,  # 新增：embedding ONNX session 是否实际加载
+        "reranker_loaded": reranker_loaded,    # 新增：reranker ONNX session 是否实际加载
         "warmup": _warmup_state,
         "warmup_error": _warmup_error or None,
         "index_queue_size": _index_queue.qsize(),
@@ -589,7 +645,9 @@ class AkariMemHandler(BaseHTTPRequestHandler):
                     "status": "ok",
                     "total": stats["total"],
                     "warmup": stats["warmup"],
-                    "models_loaded": stats["models_loaded"],
+                    "models_loaded": stats["models_loaded"],          # 向后兼容
+                    "embedding_loaded": stats["embedding_loaded"],    # 新增：embedding ONNX session 实际加载状态
+                    "reranker_loaded": stats["reranker_loaded"],      # 新增：reranker ONNX session 实际加载状态
                 })
 
             elif path == "/list":

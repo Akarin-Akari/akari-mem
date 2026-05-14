@@ -322,6 +322,8 @@ class OnnxReranker(Reranker):
         device: str = "cuda",
         max_length: int = 256,
         gpu_mem_limit_gb: float = 1.0,
+        prefer_int8: bool = True,
+        cpu_threads: int = 0,
     ):
         self._model_name = model_name
         self._cache_dir = cache_dir or os.environ.get(
@@ -330,21 +332,34 @@ class OnnxReranker(Reranker):
         self._device = (device or "cuda").lower()
         self._max_length = int(max_length)
         self._gpu_mem_limit_bytes = int(gpu_mem_limit_gb * 1024 * 1024 * 1024)
+        # CPU mode prefers the official INT8 ONNX (267MB, AVX-512 VNNI accelerated,
+        # static quantization by HF Optimum — 53/1087 ops quantized covering all
+        # MatMul/Gemm hotspots while keeping LayerNorm/Softmax in FP32).
+        # GPU mode ignores this and falls through to FP16.
+        self._prefer_int8 = bool(prefer_int8)
+        # 0 = let ORT autodetect (= cpu_count). On R9-8940HX (16C/32T) a value
+        # of 8 tracks "physical cores / 2" which avoids SMT contention.
+        self._cpu_threads = int(cpu_threads)
         self._session = None
         self._tokenizer = None
         self._output_name: Optional[str] = None
         self._needs_token_type_ids: bool = False
+        self._variant: Optional[str] = None  # populated by _find_artifacts
 
     def _find_artifacts(self):
         """Locate ONNX + tokenizer in fastembed's HuggingFace-style cache.
 
         Layout:
             <cache>/models--{org}--{name}/snapshots/<hash>/onnx/model.onnx
-            <cache>/models--{org}--{name}/snapshots/<hash>/onnx/model_fp16.onnx  (optional)
+            <cache>/models--{org}--{name}/snapshots/<hash>/onnx/model_fp16.onnx
+            <cache>/models--{org}--{name}/snapshots/<hash>/onnx/model_int8.onnx
             <cache>/models--{org}--{name}/snapshots/<hash>/tokenizer.json
 
-        Precedence: model_fp16.onnx > model.onnx
-        (FP16 cuts weights from ~1.1 GB → 531 MB, ~50% VRAM savings.)
+        Variant precedence:
+        - device=cpu + prefer_int8: model_int8 > model_fp16 > model.onnx
+          (INT8 is ~4x smaller, ~3x faster on AVX-512 VNNI vs FP32 CPU)
+        - device=cuda or prefer_int8=False: model_fp16 > model.onnx > model_int8
+          (FP16 is the GPU sweet spot; INT8 is GPU-untested for this model)
         """
         repo_dir = "models--" + self._model_name.replace("/", "--")
         snap_root = os.path.join(self._cache_dir, repo_dir, "snapshots")
@@ -362,17 +377,38 @@ class OnnxReranker(Reranker):
             raise FileNotFoundError(f"No snapshots under {snap_root}")
         snap_dir = os.path.join(snap_root, snaps[0])
         onnx_dir = os.path.join(snap_dir, "onnx")
-        # Prefer FP16 if present (half VRAM, half I/O).
+
+        int8_file = os.path.join(onnx_dir, "model_int8.onnx")
         fp16_file = os.path.join(onnx_dir, "model_fp16.onnx")
         fp32_file = os.path.join(onnx_dir, "model.onnx")
-        if os.path.exists(fp16_file):
-            onnx_file = fp16_file
-        elif os.path.exists(fp32_file):
-            onnx_file = fp32_file
+
+        # Build search order based on device + prefer_int8.
+        if self._device == "cpu" and self._prefer_int8:
+            candidates = [
+                (int8_file, "int8"),
+                (fp16_file, "fp16"),
+                (fp32_file, "fp32"),
+            ]
         else:
+            candidates = [
+                (fp16_file, "fp16"),
+                (fp32_file, "fp32"),
+                (int8_file, "int8"),
+            ]
+
+        onnx_file = None
+        for path, label in candidates:
+            if os.path.exists(path):
+                onnx_file = path
+                self._variant = label
+                break
+        if onnx_file is None:
             raise FileNotFoundError(
-                f"Neither model_fp16.onnx nor model.onnx found in {onnx_dir}"
+                f"No ONNX variant found in {onnx_dir} "
+                f"(looked for model_int8/fp16/fp32). "
+                f"Re-run with mode=fastembed once to populate the cache."
             )
+
         tok_file = os.path.join(snap_dir, "tokenizer.json")
         if not os.path.exists(tok_file):
             raise FileNotFoundError(f"tokenizer.json not found: {tok_file}")
@@ -410,7 +446,11 @@ class OnnxReranker(Reranker):
         self._tokenizer.enable_truncation(max_length=self._max_length)
         _tr("tokenizer ready")
 
-        # Tight CUDA arena (matches OnnxEmbeddingProvider).
+        # Build providers based on device.
+        # CUDA path keeps the tight-arena config (matches OnnxEmbeddingProvider).
+        # CPU path is pure CPUExecutionProvider — onnxruntime autodetects
+        # AVX-512 + VNNI on Zen 4 / Sapphire Rapids and routes QLinear ops
+        # through int8 SIMD kernels (~3-4x faster than FP32 path).
         providers = []
         if self._device == "cuda":
             providers.append((
@@ -428,10 +468,21 @@ class OnnxReranker(Reranker):
 
         sess_options = ort.SessionOptions()
         # Same EXTENDED workaround as BGE-M3 (ORT 1.23 ENABLE_ALL fusion bug).
+        # INT8 quantized models specifically need EXTENDED — ENABLE_ALL triggers
+        # QLinearMatMul fusion bugs that silently produce wrong scores.
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
         sess_options.enable_mem_pattern = False
         sess_options.enable_cpu_mem_arena = False
         sess_options.log_severity_level = 3
+
+        # CPU-specific tuning. On R9-8940HX (16C/32T) defaults often over-spawn
+        # threads and contend for SMT siblings. cpu_threads=8 (physical cores
+        # / 2) tracks ORT's "happy zone" for transformer inference.
+        if self._device == "cpu":
+            if self._cpu_threads > 0:
+                sess_options.intra_op_num_threads = self._cpu_threads
+            sess_options.inter_op_num_threads = 1
+            sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
         # Redirect fd 2 during session build (MCP stdio pipe safety).
         _stderr_log = os.path.join(os.path.dirname(onnx_file), "load_stderr.log")
@@ -466,9 +517,11 @@ class OnnxReranker(Reranker):
         actual = self._session.get_providers()
         logger.info(
             f"OnnxReranker ready: model={self._model_name}, "
+            f"variant={self._variant or 'unknown'}, "
             f"providers={actual}, output='{self._output_name}', "
             f"token_type_ids={self._needs_token_type_ids}, "
-            f"max_length={self._max_length}"
+            f"max_length={self._max_length}, "
+            f"intra_op_threads={sess_options.intra_op_num_threads if self._device == 'cpu' else 'n/a'}"
         )
 
         import gc as _gc
@@ -534,6 +587,7 @@ class OnnxReranker(Reranker):
         self._session = None
         self._tokenizer = None
         self._output_name = None
+        self._variant = None
         gc.collect()
 
 
@@ -582,6 +636,8 @@ def create_reranker(config: dict) -> Reranker:
             device=config.get("device", "cuda"),
             max_length=int(config.get("max_length", 256)),
             gpu_mem_limit_gb=float(config.get("gpu_mem_limit_gb", 1.0)),
+            prefer_int8=bool(config.get("prefer_int8", True)),
+            cpu_threads=int(config.get("cpu_threads", 0)),
         )
     elif mode == "api":
         return APIReranker(

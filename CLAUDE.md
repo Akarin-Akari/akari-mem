@@ -122,12 +122,32 @@ Agent 3 → server.py (thin client) ─┘                                  ↓
   - `store.py` `fetch_k` 从 `limit*3` 收紧到 `max(limit*2, 10)`，rerank 输入候选 -33%
   - 不再走 `FastEmbedReranker`（它不暴露 SessionOptions，VRAM 不可控）
 
-**禁止改动：**
-- ❌ 不要把 embedding 改回 sentence-transformers / fastembed-GPU
-- ❌ 不要换掉 ONNX 后端（如改回 sentence-transformers）
-- ❌ 不要把 reranker 改回 FastEmbedReranker 跑 GPU——它的 VRAM 不可控
-- ❌ 不要在 embedding/rerank 里加内部锁（之前导致死锁）
-- ❌ 不要让 search_memory 被并行调用（之前导致显存爆炸；server.py 的 `_get_deep_search_sem` 已用 asyncio 信号量串行化）
+**架构变更说明（2026-05-14/15）：Reranker 改 CPU + INT8 节省显存**
+- 主人 5070 Laptop 仅 8GB 显存，需要给本地 LLM / SD 留空间 → reranker 从 GPU FP16 改为 CPU INT8
+- 改动详情：
+  - `rerank.py` `OnnxReranker` 新增 `prefer_int8: bool = True` / `cpu_threads: int = 0` 参数，`_find_artifacts` 按 device + prefer_int8 排序选择 `model_int8.onnx` (267MB) > `model_fp16.onnx` (531MB) > `model.onnx` (FP32, ~1.1GB symlink)
+  - `_load` CPU 路径 `sess_options.intra_op_num_threads = cpu_threads`（R9-8940HX 用 8，物理核 ÷ 2 避开 SMT 争用），`inter_op_num_threads = 1`，`execution_mode = ORT_SEQUENTIAL`
+  - 用 Jina 官方静态量化的 INT8 ONNX（53/1087 ops 量化覆盖 MatMul/Gemm 热点，LayerNorm/Softmax 保留 FP32），从 hf-mirror 下载 (267MB)
+  - `config.json`：`rerank.device=cpu` / `prefer_int8=true` / `cpu_threads=8` / **`cache_dir=F:/models/fastembed`**（关键！见下）
+  - 性能（首次冷启动 5.37s vs 旧 GPU FP16 ~10s，VRAM 占用从 ~3.5GB 降至 ~2.5GB 仅 BGE-M3）
+
+## ⚠️ Reranker `cache_dir` 隐式注入陷阱（2026-05-15 踩坑）
+
+**症状**：daemon 日志稳定输出 `OnnxReranker ready: variant=fp32`，但磁盘代码、`.pyc`、端到端 `OnnxReranker(...)` 模拟全部返回 `variant=int8`。
+
+**根因**：`env_loader.py:resolve_config()` 第 41-50 行**强行把 `HF_HOME` 注入到 `rerank.cache_dir`**（仅当 config 没有显式 cache_dir 时）。
+- `.env` 设置 `HF_HOME=F:/models`（给 BGE-M3 用，正确）
+- 但 fastembed cache 在 `F:/models/fastembed/`（多一层！）
+- 注入后 `rerank.cache_dir = "F:/models"` → INT8/FP16 文件全 `exists=False` → 凑巧 `F:/models/.../model.onnx` 存在（HF transformers 标准 cache 也下了一份 1.1GB symlink → blob），命中 FP32 → 加载成功无报错 → bug 静默潜伏
+
+**修复**：`config.json` 显式 `"rerank.cache_dir": "F:/models/fastembed"`，触发 env_loader 第 48 行 `if "cache_dir" not in rnk:` 守护跳过自动注入。
+
+**绝对禁止：**
+- ❌ 不要从 `config.json` 删除 `rerank.cache_dir` —— 一删 env_loader 立刻把 `HF_HOME=F:/models` 注入回来，bug 复发
+- ❌ 不要把 `.env` 的 `HF_HOME` 改成 `F:/models/fastembed` —— 会破坏 BGE-M3 自导出 ONNX 路径解析
+- ❌ 不要在 `env_loader.resolve_config()` 移除 cache_dir 注入逻辑而不评估影响 —— `embedding.cache_dir` 依赖它
+
+详细调试历程、根因推理链、长期优化建议见：`docs/2026-05-15 Reranker INT8 加载错位 Bug 调试报告.md`
 
 ## 🔴 ONNX SessionOptions 关键参数
 
