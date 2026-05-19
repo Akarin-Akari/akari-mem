@@ -58,6 +58,18 @@ Agent 3 → server.py (thin client) ─┘                                  ↓
 - ❌ 不要在 daemon spawn 时省掉 `STARTUPINFO.SW_HIDE`——四重保险一个都不能少
 - ❌ 不要把 daemon 改成监听 0.0.0.0——必须绑 127.0.0.1（本地单机用）
 
+## 🔴 测试 MCP 工具时的数据安全规则
+
+**测试 MCP 功能时，禁止篡改、破坏、删除任何已有的记忆条目。** 正确的测试流程：
+1. 先用 `save_memory` 新建一条测试专用记忆（建议 project 设为 `akari-mem-dev`、tags 包含 `test`）
+2. 只对这条新建的测试记忆执行 update / delete 等操作验证
+3. 测试完成后清理测试数据
+
+**绝对禁止：**
+- ❌ 不要对已有的正式记忆执行 `update_memory` 来"试一下功能"
+- ❌ 不要对已有的正式记忆执行 `delete_memory` 来"清理测试"
+- ❌ 不要修改已有记忆的 tags/project/text 来"顺手整理"——除非主人明确要求
+
 **Daemon 生命周期：**
 - 启动：thin client 首次启动时按需 spawn（auto_spawn=true）
 - 模型加载：daemon 后台 warmup 线程异步加载（与 HTTP 服务并行）
@@ -73,7 +85,8 @@ Agent 3 → server.py (thin client) ─┘                                  ↓
 | `/deep` | GET | 新增 `project` `tags` filter，深度搜索串行化 |
 | `/memory?id=N` | GET | **新增** 拿单条完整内容 |
 | `/save` | POST | 改为 SQLite 即时 + ChromaDB 异步排队（不阻塞） |
-| `/delete?id=N` | DELETE | 同步删 SQLite + ChromaDB |
+| `/update` | PUT | **新增** 部分更新 (SQLite+FTS5 同步 + ChromaDB 异步) |
+| `/delete?id=N` | DELETE | 同步删 SQLite + FTS5 + ChromaDB |
 | `/shutdown` | POST | **新增** 优雅停机 |
 
 **配置（config.json 的 `daemon` section）：**

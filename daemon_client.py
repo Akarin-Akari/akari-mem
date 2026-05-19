@@ -224,6 +224,9 @@ class DaemonClient:
     def _delete(self, path: str, params: Optional[dict] = None, timeout: Optional[float] = None):
         return self._request("DELETE", path, params=params, timeout=timeout)
 
+    def _put(self, path: str, body: Optional[dict] = None, timeout: Optional[float] = None):
+        return self._request("PUT", path, body=body, timeout=timeout)
+
     # ──────────────────────────────────────────────────────────
     # MCP tool 对应的高层 API
     # ──────────────────────────────────────────────────────────
@@ -273,6 +276,25 @@ class DaemonClient:
 
     def delete_memory(self, memory_id: int) -> dict:
         return self._delete("/delete", params={"id": memory_id})
+
+    def update_memory(
+        self, memory_id: int,
+        title: Optional[str] = None,
+        text: Optional[str] = None,
+        tags: Optional[str] = None,
+        project: Optional[str] = None,
+    ) -> dict:
+        """Update an existing memory. Only non-None fields are sent."""
+        body: dict = {"id": memory_id}
+        if title is not None:
+            body["title"] = title
+        if text is not None:
+            body["text"] = text
+        if tags is not None:
+            body["tags"] = tags
+        if project is not None:
+            body["project"] = project
+        return self._put("/update", body=body)
 
     def get_stats(self) -> dict:
         return self._get("/stats")

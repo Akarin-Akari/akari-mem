@@ -23,6 +23,7 @@ Endpoints (向后兼容 + MCP 新增):
   GET    /deep?q=&limit=&project=&tags=               → 深度向量+keyword+rerank 搜索
   GET    /memory?id=N                                 → 单条完整内容 (MCP 新增)
   POST   /save  body:{title,text,tags,project}        → 异步保存 (SQLite 即时 + ChromaDB 排队)
+  PUT    /update body:{id,title?,text?,tags?,project?} → 部分更新 (SQLite+FTS5 同步 + ChromaDB 异步)
   DELETE /delete?id=N                                 → 同步删除 (SQLite + ChromaDB)
   GET    /stats                                       → 统计信息
   POST   /shutdown                                    → 优雅停机 (MCP 新增)
@@ -436,7 +437,12 @@ def _save_to_sqlite(title, text, tags, project, source):
 
 
 def _index_worker():
-    """后台线程: 消费 _index_queue 把 memory 写入 ChromaDB。"""
+    """后台线程: 消费 _index_queue 把 memory 写入 ChromaDB。
+
+    支持 save 和 update 两种场景:
+    - save: delete 是 no-op (新记录没有旧 chunks)
+    - update: delete 先清理旧 chunks，再 add 新 chunks
+    """
     from chunker import chunk_text
     while True:
         item = _index_queue.get()
@@ -449,6 +455,15 @@ def _index_worker():
             except Exception:
                 pass
             store = get_store()
+            # Delete old chunks first (idempotent: no-op for new saves)
+            try:
+                store._collection.delete(where={"sqlite_id": mem_id})
+            except Exception:
+                # Fallback: try by id pattern
+                try:
+                    store._collection.delete(ids=[f"mem_{mem_id}"])
+                except Exception:
+                    pass
             document = f"{title}\n{text}"
             chunks = chunk_text(document)
             base_meta = {
@@ -543,8 +558,27 @@ def _get_memory(memory_id):
 
 
 def _delete_full(memory_id):
-    """同步删除 SQLite + ChromaDB（如果 store 已加载）。"""
+    """同步删除 SQLite + FTS5 + ChromaDB（如果 store 已加载）。"""
     db = _db()
+    # Read original data for FTS5 content-sync delete
+    row = db.execute(
+        "SELECT title, text, tags FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()
+    if not row:
+        db.close()
+        return False
+    # Delete from FTS5 first (requires original values for content-sync)
+    try:
+        tok_title = tokenize_for_fts(row["title"])
+        tok_text = tokenize_for_fts(row["text"])
+        db.execute(
+            "INSERT INTO memories_fts(memories_fts, rowid, title, text, tags) "
+            "VALUES ('delete', ?, ?, ?, ?)",
+            (memory_id, tok_title, tok_text, row["tags"]),
+        )
+    except Exception as e:
+        logger.warning(f"FTS5 delete for #{memory_id} failed (non-fatal): {e}")
+    # Delete from SQLite
     cur = db.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
     db.commit()
     deleted = cur.rowcount > 0
@@ -555,6 +589,90 @@ def _delete_full(memory_id):
         except Exception:
             pass
     return deleted
+
+
+def _update_in_sqlite(memory_id, updates):
+    """
+    部分更新 SQLite + FTS5。
+
+    Args:
+        memory_id: 要更新的记录 ID
+        updates: dict，可选 key: title, text, tags, project
+                 只更新 dict 中存在的 key
+
+    Returns:
+        (updated_record_dict, changed_fields_set) 或 (None, None) if not found
+    """
+    from datetime import datetime, timezone
+
+    db = _db()
+    row = db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    if not row:
+        db.close()
+        return None, None
+
+    old = dict(row)
+    changed = set()
+
+    # Determine which fields actually change
+    updatable = ("title", "text", "tags", "project")
+    set_clauses = []
+    params = []
+    for field in updatable:
+        if field in updates:
+            new_val = updates[field]
+            if new_val != old[field]:
+                changed.add(field)
+            set_clauses.append(f"{field} = ?")
+            params.append(new_val)
+
+    if not set_clauses:
+        db.close()
+        return old, set()  # nothing to update
+
+    # Always bump updated_at
+    now = datetime.now(timezone.utc).isoformat()
+    set_clauses.append("updated_at = ?")
+    params.append(now)
+    params.append(memory_id)
+
+    db.execute(
+        f"UPDATE memories SET {', '.join(set_clauses)} WHERE id = ?",
+        params,
+    )
+
+    # FTS5 content-sync: delete old → insert new
+    try:
+        tok_old_title = tokenize_for_fts(old["title"])
+        tok_old_text = tokenize_for_fts(old["text"])
+        db.execute(
+            "INSERT INTO memories_fts(memories_fts, rowid, title, text, tags) "
+            "VALUES ('delete', ?, ?, ?, ?)",
+            (memory_id, tok_old_title, tok_old_text, old["tags"]),
+        )
+    except Exception as e:
+        logger.warning(f"FTS5 delete for update #{memory_id} failed (non-fatal): {e}")
+
+    # Build new values (merged)
+    new_title = updates.get("title", old["title"])
+    new_text = updates.get("text", old["text"])
+    new_tags = updates.get("tags", old["tags"])
+    tok_new_title = tokenize_for_fts(new_title)
+    tok_new_text = tokenize_for_fts(new_text)
+    db.execute(
+        "INSERT INTO memories_fts(rowid, title, text, tags) VALUES (?, ?, ?, ?)",
+        (memory_id, tok_new_title, tok_new_text, new_tags),
+    )
+
+    db.commit()
+
+    # Re-read full record after update
+    updated_row = db.execute(
+        "SELECT * FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()
+    db.close()
+
+    return (dict(updated_row) if updated_row else old), changed
 
 
 def _get_stats():
@@ -754,6 +872,60 @@ class AkariMemHandler(BaseHTTPRequestHandler):
                 self._json({"error": "not found"}, 404)
         except Exception as e:
             logger.exception(f"POST {path}: {e}")
+            self._json({"error": str(e)}, 500)
+
+    def do_PUT(self):
+        _touch_request()
+        path = urlparse(self.path).path.rstrip("/") or "/"
+        try:
+            if path == "/update":
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+                try:
+                    mid = int(body.get("id", 0))
+                except (ValueError, TypeError):
+                    self._json({"error": "invalid id"}, 400)
+                    return
+                if not mid:
+                    self._json({"error": "id is required in body"}, 400)
+                    return
+                # Extract updatable fields (only those present in body)
+                updates = {}
+                for field in ("title", "text", "tags", "project"):
+                    if field in body:
+                        updates[field] = body[field]
+                if not updates:
+                    self._json({"error": "no updatable fields provided"}, 400)
+                    return
+                result, changed = _update_in_sqlite(mid, updates)
+                if result is None:
+                    self._json({"error": "not found", "id": mid}, 404)
+                    return
+                # If title or text changed, re-index in ChromaDB asynchronously
+                needs_reindex = bool(changed & {"title", "text"})
+                if needs_reindex:
+                    try:
+                        _unload_mgr.touch()
+                    except Exception:
+                        pass
+                    _index_queue.put((
+                        mid,
+                        result["title"], result["text"],
+                        result["tags"], result["project"],
+                        result.get("source", "api"),
+                    ))
+                self._json({
+                    "updated": True,
+                    "id": mid,
+                    "changed_fields": list(changed),
+                    "reindex_queued": needs_reindex,
+                    "record": result,
+                    "warmup": _warmup_state,
+                })
+            else:
+                self._json({"error": "not found"}, 404)
+        except Exception as e:
+            logger.exception(f"PUT {path}: {e}")
             self._json({"error": str(e)}, 500)
 
     def do_DELETE(self):

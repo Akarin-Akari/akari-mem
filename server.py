@@ -123,6 +123,7 @@ mcp = FastMCP(
         "- search_memory: deep hybrid search (vector+keyword+RRF+rerank), use for semantic/complex queries\n"
         "- get_memory(id): fetch full content of a memory by ID (use after search)\n"
         "- save_memory: store important findings\n"
+        "- update_memory: modify an existing memory (partial update, only changed fields)\n"
         "- list_memories: see recent entries\n"
         "Prefer quick_search first; escalate to search_memory if results are insufficient.\n"
         "Search returns compact summaries — use get_memory(id) when you need the full text."
@@ -306,6 +307,57 @@ async def delete_memory(memory_id: int) -> str:
         if result.get("deleted"):
             return f"Memory #{memory_id} deleted."
         return f"Memory #{memory_id} not found."
+
+    return await asyncio.to_thread(_impl)
+
+
+@mcp.tool()
+async def update_memory(
+    memory_id: int,
+    title: str | None = None,
+    text: str | None = None,
+    tags: str | None = None,
+    project: str | None = None,
+) -> str:
+    """
+    Update an existing memory. Only provided fields are modified; omitted fields keep their current values.
+
+    Args:
+        memory_id: The ID of the memory to update
+        title: New title (optional, omit to keep current)
+        text: New text content (optional, omit to keep current)
+        tags: New tags (optional, omit to keep current)
+        project: New project name (optional, omit to keep current)
+    """
+    def _impl():
+        # Collect only non-None fields
+        fields = {}
+        if title is not None:
+            fields["title"] = title
+        if text is not None:
+            fields["text"] = text
+        if tags is not None:
+            fields["tags"] = tags
+        if project is not None:
+            fields["project"] = project
+        if not fields:
+            return "No fields to update. Provide at least one of: title, text, tags, project."
+        try:
+            result = _client.update_memory(memory_id, **fields)
+        except DaemonError as e:
+            if "404" in str(e):
+                return f"Memory #{memory_id} not found."
+            return _err_text("[daemon error]", e)
+        changed = result.get("changed_fields", [])
+        reindexed = result.get("reindex_queued", False)
+        status = f"Memory #{memory_id} updated."
+        if changed:
+            status += f" Changed: {', '.join(changed)}."
+        else:
+            status += " No fields actually changed (values were same)."
+        if reindexed:
+            status += " Vector index update queued."
+        return status
 
     return await asyncio.to_thread(_impl)
 
