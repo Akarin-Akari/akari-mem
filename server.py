@@ -356,7 +356,7 @@ async def update_memory(
         else:
             status += " No fields actually changed (values were same)."
         if reindexed:
-            status += " Vector index update queued."
+            status += " Chroma index update queued."
         return status
 
     return await asyncio.to_thread(_impl)

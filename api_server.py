@@ -901,8 +901,9 @@ class AkariMemHandler(BaseHTTPRequestHandler):
                 if result is None:
                     self._json({"error": "not found", "id": mid}, 404)
                     return
-                # If title or text changed, re-index in ChromaDB asynchronously
-                needs_reindex = bool(changed & {"title", "text"})
+                # Chroma stores searchable document metadata too; project/tags updates
+                # must refresh chunks even when the text embedding itself is unchanged.
+                needs_reindex = bool(changed & {"title", "text", "tags", "project"})
                 if needs_reindex:
                     try:
                         _unload_mgr.touch()
@@ -917,7 +918,7 @@ class AkariMemHandler(BaseHTTPRequestHandler):
                 self._json({
                     "updated": True,
                     "id": mid,
-                    "changed_fields": list(changed),
+                    "changed_fields": sorted(changed),
                     "reindex_queued": needs_reindex,
                     "record": result,
                     "warmup": _warmup_state,
